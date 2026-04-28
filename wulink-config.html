@@ -1,0 +1,145 @@
+<script type="text/html" data-template-name="wulink-config">
+  <!-- 新增动态切换逻辑 -->
+<div class="form-row">
+  <label for="node-config-input-authType"><i class="fa fa-shield"></i> 认证方式</label>
+  <select id="node-config-input-authType" style="width:70%">
+    <option value="device">一机一密</option>
+    <option value="product">一型一密</option>
+  </select>
+</div>
+
+<!-- 公共参数 -->
+<div class="form-row">
+  <label for="node-config-input-productKey"><i class="fa fa-key"></i> productKey</label>
+  <input type="text" id="node-config-input-productKey" placeholder="4位以上数字">
+</div>
+
+<!-- 一机一密参数 -->
+<div id="auth-device-block" class="auth-block" style="display:none">
+  <div class="form-row">
+    <label for="node-config-input-deviceName"><i class="fa fa-microchip"></i> deviceName</label>
+    <input type="text" id="node-config-input-deviceName" placeholder="4位以上数字">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-deviceSecret"><i class="fa fa-lock"></i> deviceSecret</label>
+    <input type="password" id="node-config-input-deviceSecret" placeholder="12位十六进制">
+  </div>
+</div>
+
+<!-- 一型一密参数 -->
+<div id="auth-product-block" class="auth-block" style="display:none">
+  <div class="form-row">
+    <label for="node-config-input-productSecret"><i class="fa fa-lock"></i> productSecret</label>
+    <input type="password" id="node-config-input-productSecret" placeholder="12位十六进制">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-serialNumber"><i class="fa fa-barcode"></i> 设备序列号</label>
+    <input type="text" id="node-config-input-serialNumber">
+  </div>
+</div>
+
+<!-- 服务器参数 -->
+<div class="form-row">
+  <label for="node-config-input-server"><i class="fa fa-server"></i> 服务器地址</label>
+  <input type="text" id="node-config-input-server">
+</div>
+<div class="form-row">
+  <label for="node-config-input-port"><i class="fa fa-plug"></i> 通信端口</label>
+  <select id="node-config-input-port" style="width:70%">
+    <option value="1883">MQTT (1883)</option>
+    <option value="8883" selected>MQTTS (8883)</option>
+    <option value="8083">WS (8083)</option>
+    <option value="8084">WSS (8084)</option>
+  </select>
+</div>
+</script>
+
+<script>
+  console.log("jQuery版本:", $.fn.jquery); 
+</script>
+<script type="text/javascript">
+  (function () {
+    $(document).ready(function () { // 确保DOM加载完成
+      // 初始化显示状态
+      function toggleAuthFields() {;
+        let authType = $('#node-config-input-authType').val();
+        if(authType == undefined){
+          $('#node-config-input-authType').val("device");
+          authType = $('#node-config-input-authType').val();
+        }
+        console.log('切换认证方式:', authType);
+
+        // 隐藏所有参数区块并重置验证
+        $('.auth-block').hide().find('input').prop('required', false);
+
+        // 显示对应区块并设置必填
+        const targetBlock = authType === 'device' ? '#auth-device-block' : '#auth-product-block';
+        $(targetBlock).show().find('input').prop('required', true);
+
+        // 显示对应区块
+        if (authType === 'device') {
+          $('#auth-device-block').show();
+        } else {
+          $('#auth-product-block').show();
+        }
+      }
+      
+      // 绑定切换事件
+      $(document).on('change', '#node-config-input-authType', toggleAuthFields);
+
+      RED.view.events.on("view:show", function (view) {
+        if (view.type === "config") {
+          setTimeout(toggleAuthFields, 50); // 延迟确保DOM渲染
+        }
+      });
+
+      RED.events.on("nodes:add", function (node) {
+        if (node.type === 'wulink-config') {
+          setTimeout(function () {
+            toggleAuthFields();
+            RED.view.redraw();
+          }, 200);
+        }
+      });
+      // 初始化默认显示
+      setTimeout(toggleAuthFields, 200);
+    });
+  })();
+
+  // 注册节点类型
+  RED.nodes.registerType('wulink-config', {
+      category: 'config',
+      defaults: {
+        authType: { value: 'device' },
+        productKey: {
+          value: '',
+          required: true,
+          validate: RED.validators.regex(/^\d{4,}$/)
+        },
+        deviceName: {
+          value: '',
+          validate: RED.validators.regex(/^\d{4,}$/)
+        },
+        deviceSecret: {
+          value: '',
+        },
+        productSecret: {
+          value: '',
+        },
+        serialNumber: {
+          value: '',
+        },
+        server: {
+          value: 'iot.wulink.tech',
+          validate: RED.validators.regex(/^[\w.-]+$/)
+        },
+        port: {
+          value: "8883",
+          validate: RED.validators.regex(/^(1883|8883|8083|8084)$/)
+        }
+      },
+      label: function () {
+        return this.name || "WuLink配置";
+      }
+    });
+</script>

@@ -1,0 +1,33 @@
+<script type="text/html" data-template-name="flow-update">
+  <div class="form-row">
+    <label for="node-input-config"><i class="fa fa-cog"></i> 配置</label>
+    <input type="text" id="node-input-config" placeholder="选择配置" data-i18n="[placeholder]common.label.select">
+  </div>
+  <div class="form-row">
+    <label for="node-input-name"><i class="fa fa-tag"></i> 名称</label>
+    <input type="text" id="node-input-name" placeholder="可选名称">
+  </div>
+</script>
+
+<script type="text/javascript">
+  RED.nodes.registerType('flow-update', {
+    category: 'IoT',
+    color: "#4A90E2",
+    inputs: 0,
+    outputs: 1,
+    icon: "cloud-upload.png",
+    align: "right",
+    paletteLabel: "WuLink-动态流程更新",
+    defaults: {
+      name: { value: '' },
+      config: {
+        type: 'wulink-config',
+        required: true
+      }
+    },
+    label: function () {
+      return this.name || "动态流程更新";
+    },
+    labelStyle: "font-size:14px; fill:#FFF;"
+  });
+</script>

@@ -21,7 +21,7 @@ module.exports = function (RED) {
           node.log('收到消息:' + JSON.stringify(msg));
           // 统一消息ID生成规则
           const messageId = msg.id || Date.now().toString();
-          const { type, identifier, payload} = msg;
+          const { type, identifier, payload } = msg;
           let typeVal = type == undefined ? 'property' : type;
           // 根据类型分发处理逻辑
           switch (typeVal) {

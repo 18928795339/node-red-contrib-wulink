@@ -1,8 +1,6 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const mqtt = require('mqtt');
-const fs = require('fs');
-const path = require('path');
 
 module.exports = function (RED) {
   function FlowUpdateNode(config) {
@@ -544,17 +542,6 @@ module.exports = function (RED) {
           return false;
         };
       }
-
-      // 获取用户目录的正确方式
-      const getUserDir = () => {
-        // 方法1: 通过RED.settings直接获取
-        if (RED.settings.userDir) {
-          return RED.settings.userDir;
-        }
-        // 方法2: 环境变量回退
-        return process.env.NODE_RED_HOME || path.join(require('os').homedir(), '.node-red');
-      };
-
       /** 部署新流程 */
       const deployFlows = async (nodeConfigs, replaceAll, topic) => {
         try {

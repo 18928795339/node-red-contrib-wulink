@@ -18,7 +18,6 @@ module.exports = function (RED) {
       // 处理输入数据
       node.on('input', function (msg) {
         try {
-          node.log('收到消息:' + JSON.stringify(msg));
           // 统一消息ID生成规则
           const messageId = msg.id || Date.now().toString();
           const { type, identifier, payload } = msg;
@@ -52,18 +51,23 @@ module.exports = function (RED) {
         const topic = `/sys/${productKey}/${deviceName}/thing/property/batch/post`;
         const params = data.map(a => {
           return formatPayload(a.payload, a.time);
-        });
-        node.log('params: ' + JSON.stringify(params));
-        const message = {
-          id,
-          version: "1.0",
-          method: "thing.property.batch.post",
-          sentAt: Date.now(),
-          params: params
-        };
-        mqttClient.publish(topic, JSON.stringify(message), (err) => {
-          publishCallBack(err, topic, message);
-        });
+        }).filter(a => Object.keys(a.values).length > 0);
+        if (node.connectionStatus == 'connecting') {
+          node.log("MQTT重连中");
+        }
+        for (let i = 0; i < params.length; i += 100) {
+          const copyParams = params.slice(i, i + 100);
+          const message = {
+            id: Date.now().toString(),
+            version: "1.0",
+            method: "thing.property.batch.post",
+            sentAt: Date.now(),
+            params: copyParams
+          };
+          mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
+            publishCallBack(err, topic, message);
+          });
+        }
       };
 
       // 属性上报处理
@@ -75,7 +79,7 @@ module.exports = function (RED) {
           method: "thing.property.post",
           params: formatPayload(data)
         };
-        mqttClient.publish(topic, JSON.stringify(message), (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
           publishCallBack(err, topic, message);
         });
       };
@@ -104,7 +108,7 @@ module.exports = function (RED) {
           message: responseMsg,
           data
         };
-        mqttClient.publish(topic, JSON.stringify(message), (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
           publishCallBack(err, topic, message);
         });
       };

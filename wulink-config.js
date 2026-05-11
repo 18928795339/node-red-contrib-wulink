@@ -15,6 +15,11 @@ module.exports = function (RED) {
       node.deviceSecret = config.deviceSecret;
       node.server = config.server || 'iot.wulink.tech';
       node.port = config.port || '8883';
+      node.retryCount = 0;
+      node.reconnectTimer = null;
+      node.INITIAL_RETRY_DELAY = 2000;   // 初始等待2秒
+      node.MAX_RETRY_DELAY = 60000;      // 最大等待60秒
+      node.MAX_RETRY_ATTEMPTS = 10;      // 最多重试10次（可选）
 
       // 连接状态管理
       node.mqttClient = null;
@@ -28,6 +33,58 @@ module.exports = function (RED) {
         node.log('一机一密直连流程启动');
         node.connectWithCredentials();
       }
+
+      // 在构造函数末尾添加
+      node.on('close', (removed, done) => {
+        // 清理重连定时器
+        if (node.reconnectTimer) {
+          clearTimeout(node.reconnectTimer);
+          node.reconnectTimer = null;
+        }
+        // 手动关闭 MQTT 连接
+        if (node.mqttClient && node.mqttClient.connected) {
+          node.log('正在手动关闭 MQTT 连接...');
+          // 使用 end 优雅关闭，并等待完成
+          node.connectionStatus = 'disconnected';
+          node.mqttClient.end(false, () => {
+            node.log('手动关闭MQTT连接');
+            done();
+          });
+        } else {
+          done();
+        }
+      });
+    }
+
+    calculateDelay() {
+      const node = this;
+      let delay = Math.min(
+        node.INITIAL_RETRY_DELAY * Math.pow(2, node.retryCount),
+        node.MAX_RETRY_DELAY
+      );
+      // 添加±10%随机抖动，避免大量设备同时重连
+      const jitter = delay * (0.9 + Math.random() * 0.2);
+      return Math.floor(jitter);
+    }
+
+    scheduleReconnect() {
+      const node = this;
+      if (node.reconnectTimer) clearTimeout(node.reconnectTimer);
+      if (node.MAX_RETRY_ATTEMPTS && node.retryCount >= node.MAX_RETRY_ATTEMPTS) {
+        node.error(`已达到最大重试次数 (${node.MAX_RETRY_ATTEMPTS})，停止重连。`);
+        node.status({ fill: 'red', shape: 'ring', text: '重连失败，已达上限' });
+        return;
+      }
+      const delay = node.calculateDelay();
+      node.log(`MQTT 连接断开，第 ${node.retryCount + 1} 次重连将在 ${(delay / 1000).toFixed(1)} 秒后执行。`);
+      node.status({ fill: 'yellow', shape: 'ring', text: `重连等待 ${(delay / 1000).toFixed(0)}s` });
+      node.reconnectTimer = setTimeout(() => {
+        node.log(`正在执行第 ${node.retryCount + 1} 次重连...`);
+        if (node.mqttClient && typeof node.mqttClient.reconnect === 'function') {
+          node.mqttClient.reconnect();
+        }
+        node.retryCount++;
+      }, delay);
     }
 
     // 自动注册设备
@@ -110,8 +167,13 @@ module.exports = function (RED) {
               serialNumber: this.serialNumber
             }
           };
-
-          client.publish(registerTopic, JSON.stringify(message));
+          client.publish(registerTopic, JSON.stringify(message), { qos: 1 }, (err) => {
+            if (err) {
+              node.error("注册失败: " + err.message);
+            } else {
+              node.log('注册成功');
+            }
+          });
         });
 
         // 处理响应
@@ -188,9 +250,9 @@ module.exports = function (RED) {
         clientId,
         username,
         password,
-        keepalive: 60,
-        clean: true,
-        reconnectPeriod: 60000
+        keepalive: 25,
+        clean: false,
+        reconnectPeriod: 0
       };
 
       // 状态管理
@@ -200,7 +262,7 @@ module.exports = function (RED) {
         if (node.connectionStatus === 'connecting') {
           node.status({ fill: 'red', text: '连接超时' });
           node.error('MQTT连接超时');
-          node.mqttClient.end();
+          if (node.mqttClient) node.mqttClient.end(true);
         }
       }, 10000); // 10秒超时
       node.status({ fill: 'yellow', shape: 'ring', text: '连接中...' });
@@ -212,14 +274,33 @@ module.exports = function (RED) {
       node.mqttClient.on('connect', () => {
         clearTimeout(connectionTimeout);
         node.connectionStatus = 'connected';
+        node.retryCount = 0;
+        if (node.reconnectTimer) {
+          clearTimeout(node.reconnectTimer);
+          node.reconnectTimer = null;
+        }
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
         node.log('MQTT连接成功');
+      });
+
+      node.mqttClient.on('offline', () => {
+        node.log('MQTT客户端进入离线状态，准备指数退避重连');
+        node.scheduleReconnect();
+      });
+
+      node.mqttClient.on('reconnect', () => {
+        node.log('MQTT正在尝试重连...');
+        node.status({ fill: 'yellow', shape: 'ring', text: '重连中...' });
       });
 
       node.mqttClient.on('error', (err) => {
         node.connectionStatus = 'error';
         node.status({ fill: 'red', shape: 'ring', text: '连接错误' });
         node.error('MQTT错误: ' + err.message);
+        // 若尚未处于重连调度中且连接未关闭，则启动重连
+        if (!node.reconnectTimer && node.mqttClient && !node.mqttClient.connected) {
+          node.scheduleReconnect();
+        }
       });
 
       node.mqttClient.on('close', () => {
@@ -229,12 +310,15 @@ module.exports = function (RED) {
 
         if (node.connectionStatus !== 'disconnected') {
           node.connectionStatus = 'reconnecting';
-          node.status({ fill: 'yellow', shape: 'ring', text: '重连中...' });
+          node.connectionStatus = 'reconnecting';
+          node.log('MQTT连接关闭，调度重连');
+          node.scheduleReconnect();
         }
       });
 
       node.mqttClient.on('end', () => {
         node.connectionStatus = 'disconnected';
+        node.log('MQTT已断开');
         node.status({ fill: 'grey', shape: 'ring', text: '已断开' });
       });
     }

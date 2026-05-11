@@ -9,11 +9,11 @@ module.exports = function (RED) {
       node.error('MQTT未连接');
       node.status({ fill: 'red', shape: 'ring', text: '未连接' });
     } else {
-      const {productKey, deviceName} = node.configNode;
+      const { productKey, deviceName } = node.configNode;
       // 设置属性Topic
       const setTopic = `/sys/${productKey}/${deviceName}/thing/property/set`;
       // 服务调用topic
-      const serviceTopic = `/sys/${productKey}/${deviceName}/thing/service/+`; 
+      const serviceTopic = `/sys/${productKey}/${deviceName}/thing/service/+`;
 
       mqttClient.on('connect', () => {
         node.status({ fill: 'green', shape: 'dot', text: '监听中' });
@@ -68,7 +68,7 @@ module.exports = function (RED) {
           }
         } catch (e) {
           node.error("指令解析错误: " + e.message);
-        }  
+        }
       });
 
       // 监听配置节点的连接状态变化

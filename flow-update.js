@@ -21,8 +21,11 @@ module.exports = function (RED) {
       // 订阅配置Topic
       mqttClient.on('connect', () => {
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
-        mqttClient.subscribe(mqTopic, { qos: 0 }, (err) => {
+        mqttClient.subscribe(mqTopic, { qos: 1 }, (err) => {
           if (!err) node.log(`已订阅配置下发Topic: ${mqTopic}`);
+        });
+        mqttClient.subscribe(otaTopic, { qos: 1 }, (err) => {
+          if (!err) node.log(`已订阅OTA更新Topic: ${otaTopic}`);
         });
       });
 
@@ -616,7 +619,7 @@ module.exports = function (RED) {
                 version: "1.0",
                 code: 20000,
                 message: "配置更新成功"
-              }));
+              }), { qos: 1 });
             } else {
               mqttClient.publish(topic + '_reply', JSON.stringify({
                 id: payload.id,
@@ -624,11 +627,15 @@ module.exports = function (RED) {
                 version: "1.0",
                 code: 40000,
                 message: "配置更新失败"
-              }));
+              }), { qos: 1 });
             }
           } catch (err) {
             node.error("处理消息时出错:" + err.message);
           }
+        } else if (topic === otaTopic) {
+          node.log("收到OTA数据: " + message);
+          const data = JSON.parse(message);
+          node.send(JSON.parse(message));
         }
       });
 

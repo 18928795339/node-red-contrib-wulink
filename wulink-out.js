@@ -93,7 +93,7 @@ module.exports = function (RED) {
           method: `thing.event.${identifier}.post`,
           params: formatPayload(data)
         };
-        mqttClient.publish(topic, JSON.stringify(message), { qos: 0, retain: true }, (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
           publishCallBack(err, topic, message);
         });
       };

@@ -8,7 +8,8 @@
       "wulink-config": "wulink-config.js",
       "wulink-in": "wulink-in.js",
       "wulink-out": "wulink-out.js",
-      "flow-update": "flow-update.js"
+      "flow-update": "flow-update.js",
+      "ota-upgrade": "ota-upgrade.js"
     }
   },
   "dependencies": {

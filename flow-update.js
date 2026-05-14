@@ -1,6 +1,4 @@
-const crypto = require('crypto');
 const axios = require('axios');
-const mqtt = require('mqtt');
 
 module.exports = function (RED) {
   function FlowUpdateNode(config) {
@@ -8,7 +6,11 @@ module.exports = function (RED) {
     const node = this;
     node.configNode = RED.nodes.getNode(config.config);
     const mqttClient = node.configNode?.mqttClient;
-    if (mqttClient?.connected) {
+    const PERSIST_STORE = 'file';
+    const LAST_CONFIG_KEY = 'wulink:lastConfigMessage';
+    const OTA_STATE_KEY = 'wulink:otaState';
+
+    if (!node.configNode || !mqttClient) {
       node.error('MQTT未连接');
       node.status({ fill: 'red', shape: 'ring', text: '未连接' });
     } else {
@@ -16,18 +18,135 @@ module.exports = function (RED) {
       node.log(node.configNode);
       const { productKey, deviceName } = node.configNode;
       const mqTopic = `/sys/${productKey}/${deviceName}/thing/config/push`;
-      const otaTopic = '/ota/update/push'
 
-      // 订阅配置Topic
-      mqttClient.on('connect', () => {
+      const subscribeTopic = () => {
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
         mqttClient.subscribe(mqTopic, { qos: 1 }, (err) => {
           if (!err) node.log(`已订阅配置下发Topic: ${mqTopic}`);
         });
-        mqttClient.subscribe(otaTopic, { qos: 1 }, (err) => {
-          if (!err) node.log(`已订阅OTA更新Topic: ${otaTopic}`);
+      };
+
+      if (mqttClient.connected) {
+        subscribeTopic();
+      }
+      mqttClient.on('connect', subscribeTopic);
+
+      const getPersisted = (key, defaultValue) => {
+        try {
+          const value = node.context().flow.get(key, PERSIST_STORE);
+          return value === undefined ? defaultValue : value;
+        } catch (error) {
+          node.warn(`读取持久化上下文失败(${key}): ${error.message}`);
+          return defaultValue;
+        }
+      };
+
+      const setPersisted = (key, value) => {
+        try {
+          node.context().flow.set(key, value, PERSIST_STORE);
+          return value;
+        } catch (error) {
+          node.warn(`写入持久化上下文失败(${key}): ${error.message}`);
+          return value;
+        }
+      };
+
+      const cacheLastConfigMessage = (payload) => {
+        setPersisted(LAST_CONFIG_KEY, {
+          updatedAt: new Date().toISOString(),
+          payload
         });
-      });
+      };
+
+      const updateOtaState = (patch) => {
+        const previousState = getPersisted(OTA_STATE_KEY, {}) || {};
+        return setPersisted(OTA_STATE_KEY, {
+          ...previousState,
+          ...patch,
+          updatedAt: new Date().toISOString()
+        });
+      };
+
+      const clearContextStore = (storeName) => {
+        try {
+          const keys = storeName ? node.context().flow.keys(storeName) : node.context().flow.keys();
+          keys.forEach((key) => {
+            if (storeName) {
+              node.context().flow.set(key, undefined, storeName);
+            } else {
+              node.context().flow.set(key, undefined);
+            }
+          });
+        } catch (error) {
+          node.warn(`清理 ${storeName || 'memory'} 上下文失败: ${error.message}`);
+        }
+      };
+
+      const persistRuntimeConfig = (data) => {
+        clearContextStore();
+        if (!data.nodeConfigs.reportAtBreakPoint) {
+          clearContextStore('file');
+        }
+        node.context().flow.set('configs', data.channelConfigs, 'file');
+        node.context().flow.set('reportAtBreakPoint', data.nodeConfigs.reportAtBreakPoint, 'file');
+        node.context().flow.set('configs', data.channelConfigs);
+        node.context().flow.set('reportAtBreakPoint', data.nodeConfigs.reportAtBreakPoint);
+      };
+
+      const restoreFlowsIfNeeded = async () => {
+        const otaState = getPersisted(OTA_STATE_KEY, {});
+        if (!otaState || otaState.status !== 'restore_needed') {
+          return;
+        }
+
+        const otaReplyTopic = `${otaState.otaTopic || '/ota/update/push'}_reply`;
+        const otaRequest = otaState.request;
+        const replyOtaResult = (code, message) => {
+          mqttClient.publish(otaReplyTopic, JSON.stringify({
+            id: otaRequest?.id,
+            method: otaRequest?.method ? `${otaRequest.method}_reply` : undefined,
+            version: otaRequest?.version || '1.0',
+            productKey,
+            deviceName,
+            code,
+            message
+          }), { qos: 1 });
+        };
+
+        const cachedConfig = getPersisted(LAST_CONFIG_KEY, null);
+        const restoreData = cachedConfig?.payload?.data;
+        if (!restoreData?.nodeConfigs || !restoreData?.channelConfigs) {
+          updateOtaState({
+            status: 'restore_failed',
+            restoreError: '未找到可恢复的配置缓存'
+          });
+          replyOtaResult(40000, 'OTA恢复失败: 未找到可恢复的配置缓存');
+          node.error('OTA 恢复失败：未找到可恢复的配置缓存');
+          return;
+        }
+
+        node.status({ fill: 'yellow', shape: 'ring', text: 'OTA恢复中' });
+        const success = await deployFlows(restoreData.nodeConfigs, restoreData.replaceAll, 'ota-restore');
+        if (!success) {
+          updateOtaState({
+            status: 'restore_failed',
+            restoreError: '重建流程失败'
+          });
+          replyOtaResult(40000, 'OTA恢复失败: 重建流程失败');
+          node.status({ fill: 'red', shape: 'ring', text: 'OTA恢复失败' });
+          return;
+        }
+
+        persistRuntimeConfig(restoreData);
+        updateOtaState({
+          status: 'done',
+          restoredAt: new Date().toISOString(),
+          restoreError: undefined
+        });
+        replyOtaResult(20000, 'OTA恢复成功');
+        node.status({ fill: 'green', shape: 'dot', text: 'OTA恢复完成' });
+        node.log('OTA 恢复完成，已根据磁盘缓存重新部署流程');
+      };
 
       class FlowsCreateUtil {
         getFlows(configData) {
@@ -549,41 +668,49 @@ module.exports = function (RED) {
         try {
           const flowsCreateutil = new FlowsCreateUtil();
           const flows = flowsCreateutil.getFlows(nodeConfigs);
-          if (replaceAll) {
-            return await updateFlows(flows, topic);
-          } else {
-            return await axios.get('http://localhost:1880/admin/flows', {
-              headers: {
-                // 'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'Node-RED-API-Version': 'v2',
-                'Node-RED-Deployment-Type': 'nodes',
-              }
-            }).then(async (res) => {
-              node.log("获取流程数据:" + JSON.stringify(res.data));
-              const keepNodes = ['tab', 'wulink-config', 'wulink-in', 'wulink-out', 'flow-update'];
-              const oldNodes = res.data.flows.filter(a => keepNodes.includes(a.type));
-              const nodeMap = new Map();
-              for (const item of oldNodes) {
-                nodeMap.set(item.type, item);
-              }
+          return await axios.get('http://localhost:1880/admin/flows', {
+            headers: {
+              // 'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'Node-RED-API-Version': 'v2',
+              'Node-RED-Deployment-Type': 'nodes',
+            }
+          }).then(async (res) => {
+            node.log("获取流程数据:" + JSON.stringify(res.data));
+            const keepNodes = ['tab', 'wulink-config', 'wulink-in', 'wulink-out', 'flow-update', 'ota-upgrade', 'exec'];
+            const baseNodes = res.data.flows.filter(a => keepNodes.includes(a.type));
+            const nodeMap = new Map();
+            for (const item of baseNodes) {
+              nodeMap.set(item.type, item);
+            }
+
+            if (!nodeMap.get('tab') || !nodeMap.get('wulink-in') || !nodeMap.get('wulink-out')) {
+              throw new Error('缺少基础静态节点(tab/wulink-in/wulink-out)，无法部署动态流程');
+            }
+
+            if (nodeMap.get('wulink-in').wires?.length) {
               nodeMap.get('wulink-in').wires = [[]];
-              for (const item of flows) {
-                item["z"] = nodeMap.get('tab').id;
-                if (item.needReport) {
-                  if (item.wires == undefined) {
-                    item.wires = [[]];
-                  }
-                  item.wires[0].push(nodeMap.get('wulink-out').id);
-                } else if (item.needWrite) {
-                  nodeMap.get('wulink-in').wires[0].push(item.id);
+            } else {
+              nodeMap.get('wulink-in').wires = [[]];
+            }
+
+            for (const item of flows) {
+              item["z"] = nodeMap.get('tab').id;
+              if (item.needReport) {
+                if (item.wires == undefined) {
+                  item.wires = [[]];
                 }
+                item.wires[0].push(nodeMap.get('wulink-out').id);
+              } else if (item.needWrite) {
+                nodeMap.get('wulink-in').wires[0].push(item.id);
               }
-              oldNodes.push(...flows);
-              node.log("更新后的数据:" + JSON.stringify(oldNodes));
-              return await updateFlows(oldNodes);
-            })
-          }
+            }
+
+            const deployNodes = [...baseNodes, ...flows];
+            node.log(`动态流程部署模式: ${replaceAll ? 'replaceAll(保留静态节点)' : 'merge(保留静态节点)'}`);
+            node.log("更新后的数据:" + JSON.stringify(deployNodes));
+            return await updateFlows(deployNodes, topic);
+          })
         } catch (err) {
           node.error(`部署失败: ${err}`);
           return false;
@@ -592,26 +719,21 @@ module.exports = function (RED) {
 
 
       // 处理配置消息
-      mqttClient.on('message', async (topic, message) => {
+      const handleMessage = async (topic, message) => {
         if (topic === mqTopic) {
           try {
             node.log("收到配置数据: " + message);
-            const payload = JSON.parse(message);
+            const payload = JSON.parse(message.toString());
             const data = payload.data;
             const success = await deployFlows(data.nodeConfigs, data.replaceAll, topic);
             node.log('流程部署返回结果: ' + success);
             if (success) {
-              const keys = node.context().flow.keys();
-              // 部署成功后应清空上下文缓存
-              keys.forEach(key => {
-                node.context().flow.set(key, undefined);
+              cacheLastConfigMessage(payload);
+              persistRuntimeConfig(data);
+              updateOtaState({
+                status: 'idle',
+                restoreError: undefined
               });
-              node.context().flow.set('configs', data.channelConfigs, 'file');
-              node.context().flow.set('reportAtBreakPoint', data.nodeConfigs.reportAtBreakPoint);
-              // 立刻从文件读回并打印
-              const saved = node.context().flow.get('configs', 'file');
-              /* 触发配置缓存更新 */
-              node.context().flow.set('configs', undefined);
               node.log("通道配置更新成功");
               mqttClient.publish(topic + '_reply', JSON.stringify({
                 id: payload.id,
@@ -632,12 +754,29 @@ module.exports = function (RED) {
           } catch (err) {
             node.error("处理消息时出错:" + err.message);
           }
-        } else if (topic === otaTopic) {
-          node.log("收到OTA数据: " + message);
-          const data = JSON.parse(message);
-          node.send(JSON.parse(message));
         }
-      });
+      };
+
+      mqttClient.on('message', handleMessage);
+      setTimeout(() => {
+        restoreFlowsIfNeeded().catch((error) => {
+          const otaState = getPersisted(OTA_STATE_KEY, {});
+          const otaReplyTopic = `${otaState?.otaTopic || '/ota/update/push'}_reply`;
+          const otaRequest = otaState?.request;
+          node.error(`OTA 恢复流程异常: ${error.message}`);
+          updateOtaState({
+            status: 'restore_failed',
+            restoreError: error.message
+          });
+          mqttClient.publish(otaReplyTopic, JSON.stringify({
+            id: otaRequest?.id,
+            method: otaRequest?.method ? `${otaRequest.method}_reply` : undefined,
+            version: otaRequest?.version || '1.0',
+            code: 40000,
+            message: `OTA恢复失败: ${error.message}`
+          }), { qos: 1 });
+        });
+      }, 1500);
 
       // 监听配置节点的连接状态变化
       if (node.configNode) {
@@ -650,6 +789,7 @@ module.exports = function (RED) {
       // 节点关闭处理
       node.on('close', () => {
         if (node.configNode?.mqttClient) {
+          node.configNode.mqttClient.removeListener('connect', subscribeTopic);
           node.configNode.mqttClient.removeListener('message', handleMessage);
         }
         node.status({});

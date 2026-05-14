@@ -1,0 +1,68 @@
+<script type="text/html" data-template-name="ota-upgrade">
+  <div class="form-row">
+    <label for="node-input-config"><i class="fa fa-cog"></i> 配置</label>
+    <input type="text" id="node-input-config" placeholder="选择配置">
+  </div>
+  <div class="form-row">
+    <label for="node-input-otaTopic"><i class="fa fa-rss"></i> OTA Topic</label>
+    <input type="text" id="node-input-otaTopic" placeholder="/ota/update/push">
+  </div>
+  <div class="form-row">
+    <label for="node-input-packageUrlField"><i class="fa fa-link"></i> 包链接字段</label>
+    <input type="text" id="node-input-packageUrlField" placeholder="data.packageUrl">
+  </div>
+  <div class="form-row">
+    <label for="node-input-restartStrategy"><i class="fa fa-refresh"></i> 重启策略</label>
+    <select id="node-input-restartStrategy">
+      <option value="custom-command">自定义命令</option>
+      <option value="process-exit">process.exit(0)</option>
+    </select>
+  </div>
+  <div class="form-row">
+    <label for="node-input-restartCommand"><i class="fa fa-terminal"></i> 重启命令</label>
+    <input type="text" id="node-input-restartCommand" placeholder="service node-red restart">
+  </div>
+  <div class="form-row">
+    <label for="node-input-restartDelayMs"><i class="fa fa-clock-o"></i> 重启延迟(ms)</label>
+    <input type="number" id="node-input-restartDelayMs" placeholder="3000" min="0">
+  </div>
+  <div class="form-row">
+    <label for="node-input-name"><i class="fa fa-tag"></i> 名称</label>
+    <input type="text" id="node-input-name" placeholder="可选名称">
+  </div>
+</script>
+
+<script type="text/javascript">
+  RED.nodes.registerType('ota-upgrade', {
+    category: 'IoT',
+    color: '#F5A623',
+    inputs: 0,
+    outputs: 0,
+    icon: 'bridge.svg',
+    align: 'right',
+    paletteLabel: 'WuLink-OTA升级',
+    defaults: {
+      name: { value: '' },
+      config: {
+        type: 'wulink-config',
+        required: true
+      },
+      otaTopic: { value: '/ota/update/push', required: true },
+      packageUrlField: { value: 'data.packageUrl', required: true },
+      restartStrategy: { value: 'custom-command', required: true },
+      restartCommand: { value: 'service node-red restart' },
+      restartDelayMs: { value: 3000, required: true, validate: RED.validators.number() }
+    },
+    label: function () {
+      return this.name || 'OTA升级';
+    },
+    oneditprepare: function () {
+      const toggleRestartCommand = () => {
+        const useCommand = $('#node-input-restartStrategy').val() === 'custom-command';
+        $('#node-input-restartCommand').prop('disabled', !useCommand);
+      };
+      $('#node-input-restartStrategy').on('change', toggleRestartCommand);
+      toggleRestartCommand();
+    }
+  });
+</script>

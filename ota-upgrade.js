@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { exec } = require('child_process');
 
 module.exports = function (RED) {
@@ -8,6 +10,9 @@ module.exports = function (RED) {
         const mqttClient = node.configNode?.mqttClient;
         const PERSIST_STORE = 'file';
         const OTA_STATE_KEY = 'wulink:otaState';
+        const userDir = RED.settings.userDir || process.cwd();
+        const dataDir = path.join(userDir, 'data');
+        const OTA_STATE_FILE = path.join(dataDir, 'wulink-ota-state.json');
 
         const otaTopic = config.otaTopic || '/ota/update/push';
         const packageUrlField = config.packageUrlField || 'data.packageUrl';
@@ -17,24 +22,12 @@ module.exports = function (RED) {
         const { productKey, deviceName } = node.configNode;
 
         let pendingTask = null;
-
-        const getPersisted = (key, defaultValue) => {
+        const writeJsonFileSync = (filePath, value) => {
             try {
-                const value = node.context().flow.get(key, PERSIST_STORE);
-                return value === undefined ? defaultValue : value;
+                fs.mkdirSync(path.dirname(filePath), { recursive: true });
+                fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
             } catch (error) {
-                node.warn(`读取持久化上下文失败(${key}): ${error.message}`);
-                return defaultValue;
-            }
-        };
-
-        const setPersisted = (key, value) => {
-            try {
-                node.context().flow.set(key, value, PERSIST_STORE);
-                return value;
-            } catch (error) {
-                node.warn(`写入持久化上下文失败(${key}): ${error.message}`);
-                return value;
+                node.warn(`写入文件失败(${filePath}): ${error.message}`);
             }
         };
 
@@ -64,12 +57,13 @@ module.exports = function (RED) {
         };
 
         const updateOtaState = (patch) => {
-            const previousState = getPersisted(OTA_STATE_KEY, {}) || {};
-            return setPersisted(OTA_STATE_KEY, {
-                ...previousState,
+            const nextState = {
                 ...patch,
                 updatedAt: new Date().toISOString()
-            });
+            };
+
+            writeJsonFileSync(OTA_STATE_FILE, nextState);
+            return nextState;
         };
 
         const buildInstallCommand = (packageUrl) => `npm install "${packageUrl}"`;
@@ -91,7 +85,7 @@ module.exports = function (RED) {
             });
 
             node.status({ fill: 'blue', shape: 'dot', text: '安装中' });
-            exec(installCommand, (error, stdout, stderr) => {
+            exec(installCommand, { cwd: '/work/node-red', timeout: 60000 }, (error, stdout, stderr) => {
                 if (stdout) {
                     node.log(`安装命令输出: ${stdout}`);
                 }
@@ -119,6 +113,7 @@ module.exports = function (RED) {
                     otaTopic,
                     restartDelayMs
                 });
+                publishReply(payload, 20000, 'OTA 安装完成，准备重启 Node-RED');
                 scheduleRestart();
             });
         };
@@ -135,7 +130,27 @@ module.exports = function (RED) {
                 }
 
                 node.warn(`开始执行重启命令: ${restartCommand}`);
-                exec(restartCommand);
+                exec(restartCommand, (error, stdout, stderr) => {
+                    if (stdout) {
+                        node.log(`重启命令输出: ${stdout}`);
+                    }
+                    if (stderr) {
+                        node.warn(`重启命令告警: ${stderr}`);
+                    }
+                    if (error) {
+                        node.warn(`重启命令执行失败: ${error}`);
+                        updateOtaState({
+                            status: 'restart_failed',
+                            restartError: error.message,
+                            restartFinishedAt: new Date().toISOString()
+                        });
+                        if (pendingTask?.payload) {
+                            publishReply(pendingTask.payload, 40000, `OTA 重启失败: ${error.message}`);
+                        }
+                        node.status({ fill: 'red', shape: 'ring', text: 'OTA 重启失败' });
+                        node.error(`OTA 重启失败: ${error.message}`);
+                    }
+                });
             }, restartDelayMs);
         };
 

@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 
 module.exports = function (RED) {
@@ -9,6 +11,10 @@ module.exports = function (RED) {
     const PERSIST_STORE = 'file';
     const LAST_CONFIG_KEY = 'wulink:lastConfigMessage';
     const OTA_STATE_KEY = 'wulink:otaState';
+    const userDir = RED.settings.userDir || process.cwd();
+    const dataDir = path.join(userDir, 'data');
+    const LAST_CONFIG_FILE = path.join(dataDir, 'wulink-last-config.json');
+    const OTA_STATE_FILE = path.join(dataDir, 'wulink-ota-state.json');
 
     if (!node.configNode || !mqttClient) {
       node.error('MQTT未连接');
@@ -51,20 +57,58 @@ module.exports = function (RED) {
         }
       };
 
+      const readJsonFileSync = (filePath, defaultValue) => {
+        try {
+          if (!fs.existsSync(filePath)) {
+            return defaultValue;
+          }
+          return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        } catch (error) {
+          node.warn(`读取文件失败(${filePath}): ${error.message}`);
+          return defaultValue;
+        }
+      };
+
+      const writeJsonFileSync = (filePath, value) => {
+        try {
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
+        } catch (error) {
+          node.warn(`写入文件失败(${filePath}): ${error.message}`);
+        }
+      };
+
+      const getOtaState = () => {
+        const fileState = readJsonFileSync(OTA_STATE_FILE, null);
+        return fileState;
+      };
+
+      const getLastConfigMessage = () => {
+        const fileCache = readJsonFileSync(LAST_CONFIG_FILE, null);
+        if (fileCache) {
+          return fileCache;
+        }
+        return getPersisted(LAST_CONFIG_KEY, null);
+      };
+
       const cacheLastConfigMessage = (payload) => {
-        setPersisted(LAST_CONFIG_KEY, {
+        const cache = {
           updatedAt: new Date().toISOString(),
           payload
-        });
+        };
+        setPersisted(LAST_CONFIG_KEY, cache);
+        writeJsonFileSync(LAST_CONFIG_FILE, cache);
       };
 
       const updateOtaState = (patch) => {
-        const previousState = getPersisted(OTA_STATE_KEY, {}) || {};
-        return setPersisted(OTA_STATE_KEY, {
+        const previousState = getOtaState() || {};
+        const nextState = {
           ...previousState,
           ...patch,
           updatedAt: new Date().toISOString()
-        });
+        };
+        writeJsonFileSync(OTA_STATE_FILE, nextState);
+        return nextState;
       };
 
       const clearContextStore = (storeName) => {
@@ -94,11 +138,10 @@ module.exports = function (RED) {
       };
 
       const restoreFlowsIfNeeded = async () => {
-        const otaState = getPersisted(OTA_STATE_KEY, {});
+        const otaState = getOtaState();
         if (!otaState || otaState.status !== 'restore_needed') {
           return;
         }
-
         const otaReplyTopic = `${otaState.otaTopic || '/ota/update/push'}_reply`;
         const otaRequest = otaState.request;
         const replyOtaResult = (code, message) => {
@@ -113,7 +156,7 @@ module.exports = function (RED) {
           }), { qos: 1 });
         };
 
-        const cachedConfig = getPersisted(LAST_CONFIG_KEY, null);
+        const cachedConfig = getLastConfigMessage();
         const restoreData = cachedConfig?.payload?.data;
         if (!restoreData?.nodeConfigs || !restoreData?.channelConfigs) {
           updateOtaState({
@@ -759,8 +802,9 @@ module.exports = function (RED) {
 
       mqttClient.on('message', handleMessage);
       setTimeout(() => {
+        node.warn('node-red启动成功准备恢复流程...');
         restoreFlowsIfNeeded().catch((error) => {
-          const otaState = getPersisted(OTA_STATE_KEY, {});
+          const otaState = getOtaState();
           const otaReplyTopic = `${otaState?.otaTopic || '/ota/update/push'}_reply`;
           const otaRequest = otaState?.request;
           node.error(`OTA 恢复流程异常: ${error.message}`);
@@ -776,7 +820,7 @@ module.exports = function (RED) {
             message: `OTA恢复失败: ${error.message}`
           }), { qos: 1 });
         });
-      }, 1500);
+      }, 5000);
 
       // 监听配置节点的连接状态变化
       if (node.configNode) {

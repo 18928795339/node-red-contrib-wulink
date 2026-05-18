@@ -13,13 +13,12 @@ module.exports = function (RED) {
         const userDir = RED.settings.userDir || process.cwd();
         const dataDir = path.join(userDir, 'data');
         const OTA_STATE_FILE = path.join(dataDir, 'wulink-ota-state.json');
-
-        const otaTopic = config.otaTopic || '/ota/update/push';
+        const { productKey, deviceName } = node.configNode;
+        const otaTopic = config.otaTopic || `/sys/${productKey}/${deviceName}/ota/update/push`;
         const packageUrlField = config.packageUrlField || 'data.packageUrl';
         const restartStrategy = config.restartStrategy || 'custom-command';
         const restartCommand = config.restartCommand || 'service node-red restart';
         const restartDelayMs = Math.max(0, Number(config.restartDelayMs ?? 3000) || 3000);
-        const { productKey, deviceName } = node.configNode;
 
         let pendingTask = null;
         const writeJsonFileSync = (filePath, value) => {
@@ -48,8 +47,6 @@ module.exports = function (RED) {
                 id: payload?.id,
                 method: payload?.method ? `${payload.method}_reply` : undefined,
                 version: payload?.version || '1.0',
-                productKey,
-                deviceName,
                 code,
                 message,
                 ...extra

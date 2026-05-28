@@ -15,20 +15,19 @@ module.exports = function (RED) {
       // 服务调用topic
       const serviceTopic = `/sys/${productKey}/${deviceName}/thing/service/+`;
 
-      mqttClient.on('connect', () => {
+      const onConnectHandler = () => {
         node.status({ fill: 'green', shape: 'dot', text: '监听中' });
         // 订阅属性设置
-        mqttClient.subscribe(setTopic, { qos: 0 }, (err) => {
+        mqttClient.subscribe(setTopic, { qos: 1 }, (err) => {
           if (!err) node.log(`已订阅设置属性Topic: ${setTopic}`);
         });
         // 订阅服务调用
-        mqttClient.subscribe(serviceTopic, { qos: 0 }, (err) => {
+        mqttClient.subscribe(serviceTopic, { qos: 1 }, (err) => {
           if (!err) node.log(`已订阅服务调用topic: ${serviceTopic}`);
         });
-      });
+      }
 
-      // 处理平台下发指令
-      mqttClient.on('message', (topic, message) => {
+      const onMessageHandler = (topic, message) => {
         console.log('收到指令:', message.toString());
         const payload = JSON.parse(message.toString());
         try {
@@ -69,7 +68,12 @@ module.exports = function (RED) {
         } catch (e) {
           node.error("指令解析错误: " + e.message);
         }
-      });
+      }
+
+      mqttClient.on('connect', onConnectHandler);
+
+      // 处理平台下发指令
+      mqttClient.on('message', onMessageHandler);
 
       // 监听配置节点的连接状态变化
       if (node.configNode) {
@@ -80,8 +84,9 @@ module.exports = function (RED) {
 
       // 节点关闭处理
       node.on('close', () => {
-        if (node.configNode?.mqttClient) {
-          node.configNode.mqttClient.removeListener('message', handleMessage);
+        if (mqttClient) {
+          mqttClient.removeListener('connect', onConnectHandler);
+          mqttClient.removeListener('message', onMessageHandler);
         }
         node.status({});
       });

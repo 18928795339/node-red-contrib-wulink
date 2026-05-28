@@ -7,6 +7,14 @@
     <label for="node-input-name"><i class="fa fa-tag"></i> 名称</label>
     <input type="text" id="node-input-name" placeholder="可选名称">
   </div>
+  <div class="form-row">
+    <label for="node-input-qos"><i class="fa fa-tag"></i> QoS</label>
+    <select id="node-config-input-qos" style="width:70%">
+      <option value="0">0</option>
+      <option value="1">1</option>
+      <option value="2">2</option>
+    </select>
+  </div>
 </script>
 
 <script type="text/javascript">
@@ -23,7 +31,11 @@
       config: {
         type: 'wulink-config',
         required: true
-      }
+      },
+      qos: {
+        value: '1',
+        required: true,
+      },
     },
     label: function () {
       return this.name || "WuLink-上报";

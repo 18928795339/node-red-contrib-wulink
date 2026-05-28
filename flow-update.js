@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const { text } = require('stream/consumers');
 const { exec } = require('child_process');
 
 module.exports = function (RED) {
@@ -28,15 +29,68 @@ module.exports = function (RED) {
 
       const subscribeTopic = () => {
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
+        node.log("重新订阅配置下发Topic");
         mqttClient.subscribe(mqTopic, { qos: 1 }, (err) => {
-          if (!err) node.log(`已订阅配置下发Topic: ${mqTopic}`);
+          if (!err) node.log(`已订阅配置下发Topic: ${mqTopic}`)
         });
       };
 
-      if (mqttClient.connected) {
+      let onConnectHandler = () => {
         subscribeTopic();
-      }
-      mqttClient.on('connect', subscribeTopic);
+        node.log("connected");
+        /** 延迟发送缓存消息，避免因为会话尚未就绪而导致的消息丢弃问题（或者可以判断当前mqttClient.connected是否为true）*/
+        setTimeout(() => {
+          node.send({
+            _msgid: RED.util.generateId(),
+            status: { text: 'connected' }
+          });
+        }, 500);
+      };
+
+      let onOfflineHandler = () => {
+        node.log("offline");
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: 'offline' }
+        });
+      };
+
+      let onReconnectHandler = () => {
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: 'reconnect' }
+        });
+      };
+
+      let onErrorHandler = (err) => {
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: 'error' }
+        });
+      };
+
+      let onCloseHandler = () => {
+        node.log("close");
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: 'close' }
+        });
+      };
+
+      let onEndHandler = () => {
+        node.log("end");
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: 'end' }
+        });
+      };
+
+      mqttClient.on('connect', onConnectHandler);
+      mqttClient.on('offline', onOfflineHandler);
+      mqttClient.on('reconnect', onReconnectHandler);
+      mqttClient.on('error', onErrorHandler);
+      mqttClient.on('close', onCloseHandler);
+      mqttClient.on('end', onEndHandler);
 
       const getPersisted = (key, defaultValue) => {
         try {
@@ -162,7 +216,7 @@ module.exports = function (RED) {
             status: 'restore_failed',
             restoreError: '未找到可恢复的配置缓存'
           });
-          replyOtaResult(40000, 'OTA恢复失败: 未找到可恢复的配置缓存');
+          replyOtaResult(40001, 'OTA恢复失败: 未找到可恢复的配置缓存');
           node.error('OTA 恢复失败：未找到可恢复的配置缓存');
           return;
         }
@@ -174,18 +228,25 @@ module.exports = function (RED) {
             status: 'restore_failed',
             restoreError: '重建流程失败'
           });
-          replyOtaResult(40000, 'OTA恢复失败: 重建流程失败');
+          replyOtaResult(40002, 'OTA恢复失败: 重建流程失败');
           node.status({ fill: 'red', shape: 'ring', text: 'OTA恢复失败' });
           return;
         }
-
+        if(mqttClient?.connected){
+          setTimeout(() => {
+            node.send({
+              _msgid: RED.util.generateId(),
+              status: { text: 'connected' }
+            });
+          }, 500);
+        }
         persistRuntimeConfig(restoreData);
         updateOtaState({
           status: 'done',
           restoredAt: new Date().toISOString(),
           restoreError: undefined
         });
-        replyOtaResult(20000, 'OTA恢复成功');
+        replyOtaResult(20002, 'OTA恢复成功');
         node.status({ fill: 'green', shape: 'dot', text: 'OTA恢复完成' });
         node.log('OTA 恢复完成，已根据磁盘缓存重新部署流程');
       };
@@ -215,43 +276,17 @@ module.exports = function (RED) {
           }
           // 添加上报相关节点
           if (hasRead) {
-            const reportAndClearDataNode = this.getReportAndClearDataNode();
-            reportAndClearDataNode.outputs = 2;
-            reportAndClearDataNode.needReport = true;
-            const reportInjectNode = this.getInjectNode(
-              reportAndClearDataNode.id,
-              configData.reportCycle,
-            );
-            flows.push(reportAndClearDataNode);
-            flows.push(reportInjectNode);
+            let reportAndClearDataNode;
             if (configData.reportAtBreakPoint) {
-              const reportAtBreakPointNode = this.getInjectNode(
-                'queryDataFun',
-                undefined,
-                this.getProps("start", true, "bool"),
-                "reportAtBreakPoint"
-              );
-              flows.push(reportAtBreakPointNode);
-              const sql = "INSERT INTO report_cache (plc_key, timestamp, payload) VALUES (?, ?, ?)";
-              flows.push(this.getSqlitedbNode(), this.getSqliteNode([], "prepared", "insertData", sql), this.getSqliteNode([], "batch", "update", ""),
-                this.getSqliteNode([], "msg.topic", "query", ""));
-              flows.push(this.getQueryDataFunNode());
-              flows.push(this.getInjectNode('update', undefined, this.getProps("topic", "PRAGMA synchronous=FULL;PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS report_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, plc_key TEXT NOT NULL,timestamp INTEGER NOT NULL,payload TEXT NOT NULL,status TEXT DEFAULT 'pending' );", "text"),
-                "createTableInject", "0.5"));
-
-              for (const nodeConfig of flows) {
-                if (nodeConfig.name == 'reportAndClearData') {
-                  nodeConfig.wires = [['update']];
-                } else if (nodeConfig.name == 'query') {
-                  nodeConfig.wires = [['reportAndClearData', 'queryDataFun']];
-                } else if (nodeConfig.name == 'queryDataFun') {
-                  nodeConfig.wires = [['query']];
-                } else if (nodeConfig.name == 'filterAndCacheData' || nodeConfig.name == 'dataParseAndFilter') {
-                  nodeConfig.wires = [['insertData']];
-                }
-              }
+              const messageQueueNode = this.getMessageQueueNode();
+              reportAndClearDataNode = this.getReportAndClearDataNode();
+              reportAndClearDataNode.wires = [['messageQueue']];
+              messageQueueNode.needReport = true;
+              flows.push(messageQueueNode);
             } else {
-              exec("rm -rf /work/sqlite; rm -rf /work/sqlite-shm; rm -rf /work/sqlite-wal", { cwd: '/work/node-red', timeout: 5000 }, (error, stdout, stderr) => {
+              reportAndClearDataNode = this.getReportAndClearDataNode();
+              reportAndClearDataNode.needReport = true;
+              exec("rm -rf /work/sqlite", { cwd: '/work/node-red', timeout: 5000 }, (error, stdout, stderr) => {
                 if (stdout) {
                   node.log(`删除sqlite数据库输出: ${stdout}`);
                 }
@@ -263,6 +298,12 @@ module.exports = function (RED) {
                 }
               });
             }
+            const reportInjectNode = this.getInjectNode(
+              reportAndClearDataNode.id,
+              configData.reportCycle,
+            );
+            flows.push(reportAndClearDataNode);
+            flows.push(reportInjectNode);
           }
           // 添加写入相关节点
           if (hasWrite) {
@@ -492,24 +533,19 @@ module.exports = function (RED) {
 
         getFilterAndCacheDataNode(configKey) {
           const funScript =
-            "const parseValue = (value) => {\n  // 判断是否为数字，且为有限数值（排除 NaN、Infinity、-Infinity）\n  if (typeof value === 'number' && isFinite(value)) {\n      // 使用 toFixed(6) 得到四舍五入后的字符串，再转换为数字\n      const rounded = Number(value.toFixed(6));\n      // 如果舍入前后的值不相等，说明原数值小数位数超过6位，返回舍入后的值\n      if (value !== rounded) {\n          return rounded;\n      }\n  }\n  return value;\n};\n\nif (flow.get('configs') == undefined){\n  const configs = flow.get('configs', 'file');\n    if (configs == undefined){\n      node.log('获取配置为空');\n      return null;   \n    } else {\n    flow.set('configs', configs);\n    }\n    node.log('重新加载上报设置配置');\n}\nconst reportTypes = ['正常上报', '变化即上报', '差值过量上报'];\nlet data = msg.payload;\nconst configKey = node.id.substring(0, node.id.length - \"filterAndCacheData\".length - 1);\nconst reportSetting = flow.get('configs')[configKey];\nconst lastDataCacheKey = configKey + '-lastData';\nlet lastData = flow.get(lastDataCacheKey);\nif (lastData == undefined){\n  lastData = flow.get(lastDataCacheKey, 'file');\n}\nif (lastData != undefined) {\n  const filterData = {};\n    Object.keys(data).forEach(key => {\n      data[key] = parseValue(data[key]);\n      const currentValue = data[key];\n      const historyValue = lastData[key];\n      if (reportTypes[reportSetting[key].reportSetting] == '正常上报') {\n        filterData[key] = currentValue;\n      } else if (reportTypes[reportSetting[key].reportSetting] == '变化即上报'){\n        if (currentValue !== historyValue) {\n          filterData[key] = currentValue;\n        }\n      } else {\n        if (Math.abs(currentValue - historyValue) >= reportSetting[key].differenceThreshold) {\n          filterData[key] = currentValue;\n        }\n      }\n  });\n  data = filterData;\n}\nif( Object.keys(data).length == 0) {\n  return;\n}\n/** 更新缓存的最新数据 */\nflow.set(lastDataCacheKey, msg.payload);\nif (flow.get(\"reportAtBreakPoint\")){\n  flow.set(lastDataCacheKey, msg.payload, 'file');\n}\nconst reportDataCacheKey = configKey + '-reportData';\nconst reportData = flow.get(reportDataCacheKey) ?? [];\nreportData.push({\n  time: Date.now(),\n  data: data,\n});\nif(reportData.length > 100000){\n  reportData.shift();\n}\nflow.set(reportDataCacheKey, reportData);\nlet sqliteMsg = null;\n\nif (flow.get(\"reportAtBreakPoint\") || flow.get(\"reportAtBreakPoint\", 'file')) {\n  sqliteMsg = {\n    params: [\n      configKey,\n      Date.now(),        \n      JSON.stringify(data)      \n    ]\n  };\n}\nreturn sqliteMsg;";
+            "const configKey = node.id.substring(0, node.id.length - \"filterAndCacheData\".length - 1);\n/** 更新缓存的最新数据 */\nconst reportDataCacheKey = configKey + '-reportData';\nflow.set(reportDataCacheKey, msg.payload);";
           return this.getRunFunctionNode("insertData", configKey, funScript, "filterAndCacheData");
         }
 
         getReportAndClearDataNode() {
           const funcScript =
-            "try {\n    node.log('上报已采集的数据');\n    const allReportData = [];\n    let sqlmsg = undefined;\n    if (msg.oldData) {\n        /** node-red恢复运行后立刻上报上次缓存中未上报的数据 */ \n        for (const item of msg.payload) {\n            allReportData.push({\n                time: item.timestamp,\n                data: JSON.parse(item.payload),\n            })\n        }\n        const fisrtId = msg.payload[0].id;\n        const lastId = msg.payload[msg.payload.length - 1].id;\n        sqlmsg = `update report_cache set status=\"done\" where id >= ${fisrtId} and id <= ${lastId}`;\n    } else {\n        for (const key of flow.keys()) {\n            if (key.endsWith('-reportData')) {\n                const reportData = flow.get(key) ?? [];\n                allReportData.push(...reportData);\n                flow.set(key, []);\n            }\n        }\n        sqlmsg = 'delete from report_cache';\n    }\n    if (allReportData.length == 0) {\n        return;\n    }\n    const timeMap = new Map();\n    for (const item of allReportData) {\n        if (timeMap.has(item.time)) {\n            timeMap.set(item.time, { ...timeMap.get(item.time), ...item.data });\n        } else {\n            timeMap.set(item.time, item.data);\n        }\n    }\n    const sortedEntries = [...timeMap].sort((a, b) => a[0] - b[0]);\n    const sortedReportData = sortedEntries.map(entry => {\n        return {\n            time: entry[0],\n            payload: entry[1]\n        }\n    });\n    const msgs = [{ ...msg, type: 'batchProperty', payload: sortedReportData }];\n    if(sqlmsg != undefined){\n        msgs.push({ topic: sqlmsg });\n    }\n    return msgs;\n} catch (err) {\n    node.error('上报数据持久化失败: ' + err.message);\n    return null;\n}";
+            "try {\n    const parseValue = (value) => {\n        if (typeof value === 'number' && isFinite(value)) {\n            const rounded = Number(value.toFixed(6));\n            if (value !== rounded) {\n                return rounded;\n            }\n        }\n        return value;\n    };\n    node.log('上报已采集的数据');\n    let data = {};\n    const lastData = flow.get(\"lastData\");\n    const configs = flow.get(\"configs\") || flow.get(\"configs\", \"file\");\n    let allConfigs = {};\n    for (const key of Object.keys(configs)){\n        allConfigs = {...allConfigs, ...configs[key]};\n    }\n    const reportTypes = ['正常上报', '变化即上报', '差值过量上报'];\n    for (const key of flow.keys()) {\n        if (key.endsWith('-reportData')) {\n            const reportData = flow.get(key);\n            if (reportData != undefined) {\n                const filterData = {};\n                for (const metric of Object.keys(reportData)) {\n                    const currentValue = parseValue(reportData[metric]);\n                    if(lastData != undefined){\n                        const historyValue = lastData[metric];\n                        if (reportTypes[allConfigs[metric].reportSetting] == '正常上报') {\n                            filterData[metric] = currentValue;\n                        } else if (reportTypes[allConfigs[metric].reportSetting] == '变化即上报') {\n                            if (currentValue !== historyValue) {\n                                filterData[metric] = currentValue;\n                            }\n                        } else {\n                            if (historyValue == undefined || Math.abs(currentValue - historyValue) >= allConfigs[metric].differenceThreshold) {\n                                filterData[metric] = currentValue;\n                            }\n                        }\n                    } else {\n                        filterData[metric] = currentValue;\n                    }\n                }\n                data = { ...data, ...filterData };\n            }\n            flow.set(key, undefined);\n        }\n    }\n    if (Object.keys(data).length == 0) {\n        return;\n    }\n    if(lastData == undefined){\n        flow.set(\"lastData\", data);\n    } else {\n        flow.set(\"lastData\", {...lastData, ...data});\n    }\n    return {\n        ...msg, type: 'property', payload: {\n            time: Date.now(),\n            values: data,\n        }\n    };\n} catch (err) {\n    node.error('上报数据持久化失败: ' + err.message);\n    return null;\n}";
           return this.getRunFunctionNode(undefined, undefined, funcScript, "reportAndClearData");
-        }
-
-        getQueryDataFunNode() {
-          const funcScript = "// 每次调用处理一批数据，上报成功后自动处理下一批\nif(msg.start || msg.payload.length == 100){\n    let flowContext;\n    if(msg.start){\n        flowContext = { offset: 0, batchSize: 100 };\n    } else {\n        flowContext = flow.get(\"reportContext\")\n    }\n    const batchSize = flowContext.batchSize;\n    let offset = flowContext.offset;\n    flow.set(\"reportContext\", { offset: offset + 100, batchSize: 100 });\n\n    // 1. 查询一批数据\n    const sql = `SELECT id, timestamp, payload FROM report_cache \n                WHERE status = 'pending' \n                ORDER BY timestamp ASC \n                LIMIT ${batchSize} OFFSET ${offset}`;\n    return { topic: sql, oldData: true};\n} else if(!msg.deleted && msg.payload?.length < 100){\n    return {topic: 'delete from report_cache where status != \"pending\"', deleted: true};\n}\nreturn null;";
-          return this.getRunFunctionNode(undefined, undefined, funcScript, "queryDataFun");
         }
 
         getDataParserAndFilterNode(writeId, configKey) {
           const funcScript =
-            "const DATA_TYPES = {\n  HEX: 0, INT16: 1, UINT16: 2, INT32: 3, UINT32: 4, INT64: 5,\n  FLOAT32: 6, FLOAT64: 7, BOOL: 8, UTF8: 9, BYTE: 10,\n  UINT64: 11, GBK: 12\n};\nconst TRANSFER_MODE_RTU = 'RTU';\nconst DATA_ENCODING = {\n  ABCD: 1, BADC: 2,\n  CDAB: 3, DCBA: 4\n};\n\n\nconst iconv = global.get('iconv');\n\nif (!flow.get('bufferParser')) {\n  flow.set('bufferParser', {\n    // 十进制转换（支持跨节点复用）\n    dataEncode: DATA_ENCODING.ABCD,\n    convertToRealValue: function (value) {\n      // 判断是否为数字，且为有限数值（排除 NaN、Infinity、-Infinity）\n      if (typeof value === 'number' && isFinite(value)) {\n          // 使用 toFixed(6) 得到四舍五入后的字符串，再转换为数字\n          const rounded = Number(value.toFixed(6));\n          // 如果舍入前后的值不相等，说明原数值小数位数超过6位，返回舍入后的值\n          if (value !== rounded) {\n              return rounded;\n          }\n      }\n      return value;\n    },\n    // 核心解析逻辑（包含字节序处理）\n    readValue: function (buffer, dataType) {\n      const parser = this;\n      switch (dataType) {\n        case DATA_TYPES.HEX:\n          return parser._readHex(buffer);\n        case DATA_TYPES.BOOL:\n          return parser._readBit(buffer);\n        case DATA_TYPES.BYTE:\n          return parser._readInt8(buffer);\n        case DATA_TYPES.UINT16:\n          return parser._readUint16(buffer);\n        case DATA_TYPES.INT16:\n          return parser._readInt16(buffer);\n        case DATA_TYPES.UINT32:\n          return parser._readUint32(buffer);\n        case DATA_TYPES.INT32:\n          return parser._readInt32(buffer);\n        case DATA_TYPES.FLOAT32:\n          return parser.convertToRealValue(parser._readFloat32(buffer));\n        case DATA_TYPES.INT64:\n          return parser._readInt64(buffer);\n        case DATA_TYPES.UINT64:\n          return parser._readUInt64(buffer);\n        case DATA_TYPES.FLOAT64:\n          return parser.convertToRealValue(parser._readFloat64(buffer));\n        case DATA_TYPES.UTF8:\n          return parser._read(buffer, 'utf-8');\n        case DATA_TYPES.GBK:\n          return parser._read(buffer, 'gbk');\n        default:\n          throw new Error('不支持的 dataType:' + dataType);\n      }\n    },\n\n    // 具体解析方法（私有方法前缀_）\n    _readHex: function (buffer) {\n      return Array.from(new Uint8Array(buffer),\n        byte => ('0' + byte.to(16).toUpperCase()).slice(-2)).join(' ');\n    },\n\n    _readBit: function (buffer) {\n      return new DataView(buffer).getUint8(0) & 0x01;\n    },\n\n    _readInt8: function (buffer) {\n      const dv = new DataView(buffer);\n      return dv.getInt8(0);\n    },\n\n    _readUint16: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD: return dv.getUint16(0);\n        case DATA_ENCODING.BADC: return dv.getUint16(0, true);\n        default:\n          throw new Error('不支持的字节序:' + this.dataEncode);\n      }\n    },\n    _readInt16: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          return dv.getInt16(0);\n        case DATA_ENCODING.BADC:\n          return dv.getInt16(0, true);\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readInt32: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          // 大端 32 位直接读取\n          return dv.getUint32(0, false);\n\n        case DATA_ENCODING.BADC: {\n          // 先按大端取出两个寄存器值\n          let reg0 = dv.getUint16(0, false); // 原高 16 位（已交换字节）\n          let reg1 = dv.getUint16(2, false); // 原低 16 位（已交换字节）\n          // 各自交换高低字节，还原原始的高/低 16 位\n          let origHigh = ((reg0 << 8) & 0xff00) | ((reg0 >> 8) & 0x00ff);\n          let origLow = ((reg1 << 8) & 0xff00) | ((reg1 >> 8) & 0x00ff);\n          return (origHigh << 16) | origLow;\n        }\n\n        case DATA_ENCODING.CDAB: {\n          // 寄存器顺序：低 16 位在前，高 16 位在后\n          let low = dv.getUint16(0, false);\n          let high = dv.getUint16(2, false);\n          return (high << 16) | low;\n        }\n\n        case DATA_ENCODING.DCBA:\n          // 小端 32 位直接读取\n          return dv.getUint32(0, true);\n\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readUint32: function (buffer) {\n      return this._readInt32(buffer) >>> 0;\n    },\n\n    _readFloat32: function (buffer) {\n      const int32 = new Int32Array([this._readInt32(buffer)]);\n      return new Float32Array(int32.buffer)[0];\n    },\n\n    _readInt64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          return dv.getBigInt64(0);\n        case DATA_ENCODING.BADC: {\n          const buf = new Uint8Array([\n            dv.getUint8(1), dv.getUint8(0),\n            dv.getUint8(3), dv.getUint8(2),\n            dv.getUint8(5), dv.getUint8(4),\n            dv.getUint8(7), dv.getUint8(6),\n          ]);\n          return new DataView(buf.buffer).getBigInt64(0);\n        }\n        case DATA_ENCODING.CDAB: {   // 修正\n          const buf = new Uint8Array([\n            dv.getUint8(4), dv.getUint8(5),\n            dv.getUint8(6), dv.getUint8(7),\n            dv.getUint8(0), dv.getUint8(1),\n            dv.getUint8(2), dv.getUint8(3),\n          ]);\n          return new DataView(buf.buffer).getBigInt64(0);\n        }\n        case DATA_ENCODING.DCBA:\n          return dv.getBigInt64(0, true);\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readUint64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n          case DATA_ENCODING.ABCD:\n              return dv.getBigUint64(0);\n          case DATA_ENCODING.BADC: {\n              const buf = new Uint8Array([\n                  dv.getUint8(1), dv.getUint8(0),\n                  dv.getUint8(3), dv.getUint8(2),\n                  dv.getUint8(5), dv.getUint8(4),\n                  dv.getUint8(7), dv.getUint8(6),\n              ]);\n              return new DataView(buf.buffer).getBigUint64(0);\n          }\n          case DATA_ENCODING.CDAB: {\n              const buf = new Uint8Array([\n                  dv.getUint8(4), dv.getUint8(5),\n                  dv.getUint8(6), dv.getUint8(7),\n                  dv.getUint8(0), dv.getUint8(1),\n                  dv.getUint8(2), dv.getUint8(3),\n              ]);\n              return new DataView(buf.buffer).getBigUint64(0);\n          }\n          case DATA_ENCODING.DCBA:\n              return dv.getBigUint64(0, true);\n          default:\n              throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readFloat64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n          case DATA_ENCODING.ABCD:\n              return dv.getFloat64(0);\n          case DATA_ENCODING.BADC: {\n              const buf = new Uint8Array([\n                  dv.getUint8(1), dv.getUint8(0),\n                  dv.getUint8(3), dv.getUint8(2),\n                  dv.getUint8(5), dv.getUint8(4),\n                  dv.getUint8(7), dv.getUint8(6),\n              ]);\n              return new DataView(buf.buffer).getFloat64(0);\n          }\n          case DATA_ENCODING.CDAB: {   // 修正\n              const buf = new Uint8Array([\n                  dv.getUint8(4), dv.getUint8(5),\n                  dv.getUint8(6), dv.getUint8(7),\n                  dv.getUint8(0), dv.getUint8(1),\n                  dv.getUint8(2), dv.getUint8(3),\n              ]);\n              return new DataView(buf.buffer).getFloat64(0);\n          }\n          case DATA_ENCODING.DCBA:\n              return dv.getFloat64(0, true);\n          default:\n              throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _read: function (arrayBuffer, encodeType) {\n      // 2. 将 ArrayBuffer 转为 Uint8Array 以便按字节操作\n      let bytes = new Uint8Array(arrayBuffer);\n      // 3. 根据字节序交换每个16位字的两个字节（如果需要）\n      // 假设 DATA_ENCODING.ABCD 代表大端模式，this.dataEncode 为当前设定的字节序\n      if (DATA_ENCODING.ABCD != this.dataEncode) {\n          // 小端模式：交换每个字的高低位\n          for (let i = 0; i < bytes.length; i += 2) {\n              let temp = bytes[i];\n              bytes[i] = bytes[i + 1];\n              bytes[i + 1] = temp;\n          }\n      }\n      // 4. 解码：将处理后的字节 Buffer 转为字符串\n      const buffer = Buffer.from(bytes);   // 转换为 Node.js Buffer\n      let str;\n      if (encodeType === 'utf8' || encodeType === 'utf-8') {\n          str = buffer.toString('utf8');\n      } else {\n          const iconv = global.get('iconv'); // 确保已在 settings.js 中注入\n          str = iconv.decode(buffer, encodeType);\n      }\n      // 5. 去除末尾的 \\0 字符\n      str = str.replace(/\\0+$/, '');\n      return str;\n    }\n  });\n}\n\n// 主处理逻辑\nconst parser = flow.get('bufferParser');\ntry {\n  const configKey = msg.configKey;\n  const configs = flow.get('configs')[configKey];\n  const data = msg.payload;\n  const convertData = {};\n  for (const [key, value] of Object.entries(data)) {\n    if (configs[key] != undefined) {\n      const { dataType, dataEncode } = configs[key];\n      parser.dataEncode = dataEncode ?? DATA_ENCODING.ABCD;\n      // 执行解析并输出结果\n      convertData[key] = parser.readValue(\n        value,  // 输入buffer\n        dataType ?? DATA_TYPES.HEX,\n      );\n    }\n  }\n  msg.payload = convertData;\n  const lastDataCacheKey = configKey + '-lastData';\n  let lastData = flow.get(lastDataCacheKey);\n  if (lastData == undefined) {\n    lastData = flow.get(lastDataCacheKey, 'file');\n  }\n  if (lastData != undefined) {\n    const data = {};\n    const reportTypes = ['正常上报', '变化即上报', '差值过量上报'];\n    Object.keys(convertData).forEach(key => {\n      const currentValue = convertData[key];\n      const historyValue = lastData[key];\n      if (reportTypes[configs[key].reportSetting] == '正常上报') {\n        data[key] = currentValue;\n      } else if (reportTypes[configs[key].reportSetting] == '变化即上报') {\n        if (currentValue !== historyValue) {\n          data[key] = currentValue;\n        }\n      } else if (reportTypes[configs[key].reportSetting] == '差值过量上报') {\n        if (Math.abs(currentValue - historyValue) >= configs[key].differenceThreshold) {\n          data[key] = currentValue;\n        }\n      }\n    });\n    msg.payload = data;\n  }\n  if(Object.keys(msg.payload).length == 0){\n    return;\n  }\n  /** 更新缓存的最新数据 */\n  flow.set(lastDataCacheKey, convertData);\n  if (flow.get('reportAtBreakPoint')){\n    flow.set(lastDataCacheKey, convertData, 'file');\n  }\n  /** 先将需上报数据暂存 */\n  let reportDataCacheKey = configKey + '-reportData';\n  const reportData = flow.get(reportDataCacheKey) ?? [];\n  reportData.push({\n      time: Date.now(),\n      data: msg.payload,\n  })\n  if(reportData.length > 100000){\n    reportData.shift();\n  }\n  flow.set(reportDataCacheKey, reportData);\n  let sqliteMsg = null;\n  \n  if (flow.get(\"reportAtBreakPoint\") || flow.get(\"reportAtBreakPoint\", 'file')) {\n    sqliteMsg = {\n      params: [\n        configKey,\n        Date.now(),        \n        JSON.stringify(msg.payload)      \n      ]\n    };\n  }\n  return sqliteMsg;\n} catch (err) {\n  node.error(\"解析失败：\" + err.message, msg);\n  return null;\n}";
+            "const DATA_TYPES = {\n  HEX: 0, INT16: 1, UINT16: 2, INT32: 3, UINT32: 4, INT64: 5,\n  FLOAT32: 6, FLOAT64: 7, BOOL: 8, UTF8: 9, BYTE: 10,\n  UINT64: 11, GBK: 12\n};\nconst TRANSFER_MODE_RTU = 'RTU';\nconst DATA_ENCODING = {\n  ABCD: 1, BADC: 2,\n  CDAB: 3, DCBA: 4\n};\n\n\nconst iconv = global.get('iconv');\n\nif (!flow.get('bufferParser')) {\n  flow.set('bufferParser', {\n    // 十进制转换（支持跨节点复用）\n    dataEncode: DATA_ENCODING.ABCD,\n    // 核心解析逻辑（包含字节序处理）\n    readValue: function (buffer, dataType) {\n      const parser = this;\n      switch (dataType) {\n        case DATA_TYPES.HEX:\n          return parser._readHex(buffer);\n        case DATA_TYPES.BOOL:\n          return parser._readBit(buffer);\n        case DATA_TYPES.BYTE:\n          return parser._readInt8(buffer);\n        case DATA_TYPES.UINT16:\n          return parser._readUint16(buffer);\n        case DATA_TYPES.INT16:\n          return parser._readInt16(buffer);\n        case DATA_TYPES.UINT32:\n          return parser._readUint32(buffer);\n        case DATA_TYPES.INT32:\n          return parser._readInt32(buffer);\n        case DATA_TYPES.FLOAT32:\n          return parser._readFloat32(buffer);\n        case DATA_TYPES.INT64:\n          return parser._readInt64(buffer);\n        case DATA_TYPES.UINT64:\n          return parser._readUInt64(buffer);\n        case DATA_TYPES.FLOAT64:\n          return parser._readFloat64(buffer);\n        case DATA_TYPES.UTF8:\n          return parser._read(buffer, 'utf-8');\n        case DATA_TYPES.GBK:\n          return parser._read(buffer, 'gbk');\n        default:\n          throw new Error('不支持的 dataType:' + dataType);\n      }\n    },\n\n    // 具体解析方法（私有方法前缀_）\n    _readHex: function (buffer) {\n      return Array.from(new Uint8Array(buffer),\n        byte => ('0' + byte.to(16).toUpperCase()).slice(-2)).join(' ');\n    },\n\n    _readBit: function (buffer) {\n      return new DataView(buffer).getUint8(0) & 0x01;\n    },\n\n    _readInt8: function (buffer) {\n      const dv = new DataView(buffer);\n      return dv.getInt8(0);\n    },\n\n    _readUint16: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD: return dv.getUint16(0);\n        case DATA_ENCODING.BADC: return dv.getUint16(0, true);\n        default:\n          throw new Error('不支持的字节序:' + this.dataEncode);\n      }\n    },\n    _readInt16: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          return dv.getInt16(0);\n        case DATA_ENCODING.BADC:\n          return dv.getInt16(0, true);\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readInt32: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          // 大端 32 位直接读取\n          return dv.getUint32(0, false);\n\n        case DATA_ENCODING.BADC: {\n          // 先按大端取出两个寄存器值\n          let reg0 = dv.getUint16(0, false); // 原高 16 位（已交换字节）\n          let reg1 = dv.getUint16(2, false); // 原低 16 位（已交换字节）\n          // 各自交换高低字节，还原原始的高/低 16 位\n          let origHigh = ((reg0 << 8) & 0xff00) | ((reg0 >> 8) & 0x00ff);\n          let origLow = ((reg1 << 8) & 0xff00) | ((reg1 >> 8) & 0x00ff);\n          return (origHigh << 16) | origLow;\n        }\n\n        case DATA_ENCODING.CDAB: {\n          // 寄存器顺序：低 16 位在前，高 16 位在后\n          let low = dv.getUint16(0, false);\n          let high = dv.getUint16(2, false);\n          return (high << 16) | low;\n        }\n\n        case DATA_ENCODING.DCBA:\n          // 小端 32 位直接读取\n          return dv.getUint32(0, true);\n\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readUint32: function (buffer) {\n      return this._readInt32(buffer) >>> 0;\n    },\n\n    _readFloat32: function (buffer) {\n      const int32 = new Int32Array([this._readInt32(buffer)]);\n      return new Float32Array(int32.buffer)[0];\n    },\n\n    _readInt64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n        case DATA_ENCODING.ABCD:\n          return dv.getBigInt64(0);\n        case DATA_ENCODING.BADC: {\n          const buf = new Uint8Array([\n            dv.getUint8(1), dv.getUint8(0),\n            dv.getUint8(3), dv.getUint8(2),\n            dv.getUint8(5), dv.getUint8(4),\n            dv.getUint8(7), dv.getUint8(6),\n          ]);\n          return new DataView(buf.buffer).getBigInt64(0);\n        }\n        case DATA_ENCODING.CDAB: {   // 修正\n          const buf = new Uint8Array([\n            dv.getUint8(4), dv.getUint8(5),\n            dv.getUint8(6), dv.getUint8(7),\n            dv.getUint8(0), dv.getUint8(1),\n            dv.getUint8(2), dv.getUint8(3),\n          ]);\n          return new DataView(buf.buffer).getBigInt64(0);\n        }\n        case DATA_ENCODING.DCBA:\n          return dv.getBigInt64(0, true);\n        default:\n          throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readUint64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n          case DATA_ENCODING.ABCD:\n              return dv.getBigUint64(0);\n          case DATA_ENCODING.BADC: {\n              const buf = new Uint8Array([\n                  dv.getUint8(1), dv.getUint8(0),\n                  dv.getUint8(3), dv.getUint8(2),\n                  dv.getUint8(5), dv.getUint8(4),\n                  dv.getUint8(7), dv.getUint8(6),\n              ]);\n              return new DataView(buf.buffer).getBigUint64(0);\n          }\n          case DATA_ENCODING.CDAB: {\n              const buf = new Uint8Array([\n                  dv.getUint8(4), dv.getUint8(5),\n                  dv.getUint8(6), dv.getUint8(7),\n                  dv.getUint8(0), dv.getUint8(1),\n                  dv.getUint8(2), dv.getUint8(3),\n              ]);\n              return new DataView(buf.buffer).getBigUint64(0);\n          }\n          case DATA_ENCODING.DCBA:\n              return dv.getBigUint64(0, true);\n          default:\n              throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _readFloat64: function (buffer) {\n      const dv = new DataView(buffer);\n      switch (this.dataEncode) {\n          case DATA_ENCODING.ABCD:\n              return dv.getFloat64(0);\n          case DATA_ENCODING.BADC: {\n              const buf = new Uint8Array([\n                  dv.getUint8(1), dv.getUint8(0),\n                  dv.getUint8(3), dv.getUint8(2),\n                  dv.getUint8(5), dv.getUint8(4),\n                  dv.getUint8(7), dv.getUint8(6),\n              ]);\n              return new DataView(buf.buffer).getFloat64(0);\n          }\n          case DATA_ENCODING.CDAB: {   // 修正\n              const buf = new Uint8Array([\n                  dv.getUint8(4), dv.getUint8(5),\n                  dv.getUint8(6), dv.getUint8(7),\n                  dv.getUint8(0), dv.getUint8(1),\n                  dv.getUint8(2), dv.getUint8(3),\n              ]);\n              return new DataView(buf.buffer).getFloat64(0);\n          }\n          case DATA_ENCODING.DCBA:\n              return dv.getFloat64(0, true);\n          default:\n              throw new Error('不支持的数据字节序');\n      }\n    },\n\n    _read: function (arrayBuffer, encodeType) {\n      // 2. 将 ArrayBuffer 转为 Uint8Array 以便按字节操作\n      let bytes = new Uint8Array(arrayBuffer);\n      // 3. 根据字节序交换每个16位字的两个字节（如果需要）\n      // 假设 DATA_ENCODING.ABCD 代表大端模式，this.dataEncode 为当前设定的字节序\n      if (DATA_ENCODING.ABCD != this.dataEncode) {\n          // 小端模式：交换每个字的高低位\n          for (let i = 0; i < bytes.length; i += 2) {\n              let temp = bytes[i];\n              bytes[i] = bytes[i + 1];\n              bytes[i + 1] = temp;\n          }\n      }\n      // 4. 解码：将处理后的字节 Buffer 转为字符串\n      const buffer = Buffer.from(bytes);   // 转换为 Node.js Buffer\n      let str;\n      if (encodeType === 'utf8' || encodeType === 'utf-8') {\n          str = buffer.toString('utf8');\n      } else {\n          const iconv = global.get('iconv'); // 确保已在 settings.js 中注入\n          str = iconv.decode(buffer, encodeType);\n      }\n      // 5. 去除末尾的 \\0 字符\n      str = str.replace(/\\0+$/, '');\n      return str;\n    }\n  });\n}\n\n// 主处理逻辑\nconst parser = flow.get('bufferParser');\ntry {\n  const configKey = msg.configKey;\n  const configs = flow.get('configs')[configKey];\n  const data = msg.payload;\n  const convertData = {};\n  for (const [key, value] of Object.entries(data)) {\n    if (configs[key] != undefined) {\n      const { dataType, dataEncode } = configs[key];\n      parser.dataEncode = dataEncode ?? DATA_ENCODING.ABCD;\n      // 执行解析并输出结果\n      convertData[key] = parser.readValue(\n        value,  // 输入buffer\n        dataType ?? DATA_TYPES.HEX,\n      );\n    }\n  }\n  let reportDataCacheKey = configKey + '-reportData';\n  flow.set(reportDataCacheKey, convertData);\n} catch (err) {\n  node.error(\"解析失败：\" + err.message, msg);\n  return null;\n}";
           return this.getRunFunctionNode(writeId, configKey, funcScript, "dataParseAndFilter");
         }
 
@@ -531,30 +567,23 @@ module.exports = function (RED) {
           return this.getRunFunctionNode(writeId, configKey, funcScript, "createWriteRequest");
         }
 
-        getSqlitedbNode() {
-          return {
-            "id": "sqlitedb",
-            "type": "sqlitedb",
-            "db": "/work/sqlite",
-            "mode": "RWC"
-          }
-        }
-
-        getSqliteNode(writeIds, sqlquery, name, sql) {
+        getMessageQueueNode(writeId) {
           const objectNode = {
-            "id": name,
-            "type": "sqlite",
-            "mydb": "sqlitedb",
-            "sqlquery": sqlquery,
-            "sql": sql,
-            "name": name,
-            "x": 790,
-            "y": 120,
+            "id": "messageQueue",
+            "type": "queue",
+            "name": "messageQueue",
+            "connected": "^connected",
+            "connectedType": "re",
+            "disconnected": "",
+            "disconnectedType": "str",
+            "sqlite": "/work/sqlite",
+            "filesize": "10240", // 最大消息存储上线 10G
             "wires": [
-              []
+              [
+                writeId
+              ]
             ]
           }
-          this.setWriesArray(objectNode, writeIds);
           return objectNode;
         }
 
@@ -802,10 +831,14 @@ module.exports = function (RED) {
               nodeMap.get('wulink-in').wires = [[]];
             }
 
+            if (nodeConfigs.reportAtBreakPoint) {
+              nodeMap.get('flow-update').wires = [['messageQueue']];
+            }
+
             for (const item of flows) {
               item["z"] = nodeMap.get('tab').id;
               if (item.needReport) {
-                item.wires = item.wires != undefined ? [[nodeMap.get('wulink-out').id], ...item.wires] : [[nodeMap.get('wulink-out').id]];
+                item.wires = [[nodeMap.get('wulink-out').id]];
               } else if (item.needWrite) {
                 nodeMap.get('wulink-in').wires[0].push(item.id);
               }
@@ -832,6 +865,14 @@ module.exports = function (RED) {
             const data = payload.data;
             const success = await deployFlows(data.nodeConfigs, data.replaceAll, topic);
             node.log('流程部署返回结果: ' + success);
+            if (mqttClient?.connected) {
+              setTimeout(() => {
+                node.send({
+                  _msgid: RED.util.generateId(),
+                  status: { text: 'connected' }
+                });
+              }, 500);
+            }
             if (success) {
               cacheLastConfigMessage(payload);
               persistRuntimeConfig(data);
@@ -847,6 +888,7 @@ module.exports = function (RED) {
                 code: 20000,
                 message: "配置更新成功"
               }), { qos: 1 });
+              
             } else {
               mqttClient.publish(topic + '_reply', JSON.stringify({
                 id: payload.id,
@@ -894,9 +936,15 @@ module.exports = function (RED) {
 
       // 节点关闭处理
       node.on('close', () => {
-        if (node.configNode?.mqttClient) {
-          node.configNode.mqttClient.removeListener('connect', subscribeTopic);
-          node.configNode.mqttClient.removeListener('message', handleMessage);
+        if (mqttClient) {
+          mqttClient.removeListener('connect', onConnectHandler);
+          mqttClient.removeListener('offline', onOfflineHandler);
+          mqttClient.removeListener('reconnect', onReconnectHandler);
+          mqttClient.removeListener('error', onErrorHandler);
+          mqttClient.removeListener('close', onCloseHandler);
+          mqttClient.removeListener('end', onEndHandler);
+          mqttClient.removeListener('connect', subscribeTopic);
+          mqttClient.removeListener('message', handleMessage);
         }
         node.status({});
       });

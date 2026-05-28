@@ -2,6 +2,7 @@ module.exports = function (RED) {
   function WulinkReportNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
+    const qos = Number(config.qos);
     node.configNode = RED.nodes.getNode(config.config);
     if (node.configNode?.mqttClient?.connected) {
       node.error('MQTT未连接');
@@ -10,13 +11,11 @@ module.exports = function (RED) {
       const mqttClient = node.configNode?.mqttClient;
       const { productKey, deviceName } = node.configNode;
       // 状态管理
-      mqttClient.on('connect', () => {
+      const connectHandler = () => {
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
         node.log("成功连接到WuLink平台");
-      });
-
-      // 处理输入数据
-      node.on('input', function (msg) {
+      }
+      const inputHandler = (msg) => {
         try {
           // 统一消息ID生成规则
           const messageId = msg.id || Date.now().toString();
@@ -44,7 +43,10 @@ module.exports = function (RED) {
         } catch (e) {
           node.error("数据处理错误: " + e.message);
         }
-      });
+      }
+      mqttClient.on('connect', connectHandler);
+      // 处理输入数据
+      node.on('input', inputHandler);
 
       // 属性批量上报
       const handlePropertyBatchReport = (id, data) => {
@@ -64,7 +66,7 @@ module.exports = function (RED) {
             sentAt: Date.now(),
             params: copyParams
           };
-          mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
+          mqttClient.publish(topic, JSON.stringify(message), { qos: qos }, (err) => {
             publishCallBack(err, topic, message);
           });
         }
@@ -77,9 +79,9 @@ module.exports = function (RED) {
           id,
           version: "1.0",
           method: "thing.property.post",
-          params: formatPayload(data)
+          params: data
         };
-        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: qos }, (err) => {
           publishCallBack(err, topic, message);
         });
       };
@@ -93,7 +95,7 @@ module.exports = function (RED) {
           method: `thing.event.${identifier}.post`,
           params: formatPayload(data)
         };
-        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: qos }, (err) => {
           publishCallBack(err, topic, message);
         });
       };
@@ -108,7 +110,7 @@ module.exports = function (RED) {
           message: responseMsg,
           data
         };
-        mqttClient.publish(topic, JSON.stringify(message), { qos: 1 }, (err) => {
+        mqttClient.publish(topic, JSON.stringify(message), { qos: qos }, (err) => {
           publishCallBack(err, topic, message);
         });
       };
@@ -143,6 +145,10 @@ module.exports = function (RED) {
 
       // 节点关闭处理
       node.on('close', () => {
+        if(mqttClient){
+          mqttClient.removeListener('connect', connectHandler);
+          mqttClient.removeListener('message', inputHandler);
+        }
         node.status({});
       });
     }

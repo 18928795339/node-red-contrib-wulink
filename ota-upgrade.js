@@ -2,6 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 
+/**
+    node-red 需通过service或者systemctl启动，只有这样才能通过exec执行重启命令
+    * OTA 响应码说明：20000=已收到升级命令并开始下载安装；
+    * 20001=安装完成并准备重启；
+    * 20002=重启成功且流程重新加载完毕；
+    * 40000=消息处理、安装或重启过程中发生失败。
+    * 40001=重启成功但是没找到可供流程重构的配置数据
+    * 40002=有可供重新构建流程的配置数据但是重新构建流程失败
+**/ 
 module.exports = function (RED) {
     function OtaUpgradeNode(config) {
         RED.nodes.createNode(this, config);
@@ -110,7 +119,7 @@ module.exports = function (RED) {
                     otaTopic,
                     restartDelayMs
                 });
-                publishReply(payload, 20000, 'OTA 安装完成，准备重启 Node-RED');
+                publishReply(payload, 20001, 'OTA 安装完成，准备重启 Node-RED');
                 scheduleRestart();
             });
         };
@@ -218,9 +227,9 @@ module.exports = function (RED) {
         }
 
         node.on('close', () => {
-            if (node.configNode?.mqttClient) {
-                node.configNode.mqttClient.removeListener('connect', subscribeTopic);
-                node.configNode.mqttClient.removeListener('message', handleMqttMessage);
+            if (mqttClient) {
+                mqttClient.removeListener('connect', subscribeTopic);
+                mqttClient.removeListener('message', handleMqttMessage);
             }
             node.status({});
         });

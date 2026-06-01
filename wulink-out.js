@@ -18,6 +18,11 @@ module.exports = function (RED) {
       const inputHandler = (msg) => {
         try {
           // 统一消息ID生成规则
+          if(msg.close){
+            mqttClient.end(false, () => {
+              node.log('MQTT连接已关闭');
+            })
+          }
           const messageId = msg.id || Date.now().toString();
           const { type, identifier, payload } = msg;
           let typeVal = type == undefined ? 'property' : type;

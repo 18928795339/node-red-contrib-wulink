@@ -19,6 +19,15 @@ module.exports = function (RED) {
       // 连接状态管理
       node.mqttClient = null;
       node.connectionStatus = 'disconnected';
+      node.isClosing = false;
+      node.reconnectTimer = null;
+      node.reconnectAttempt = 0;
+      node.reconnectBaseDelay = 2000;
+      node.reconnectMaxDelay = 120000;
+      node.connectionTimeout = null;
+      node.boundMqttHandlers = null;
+      node.mqttUrl = null;
+      node.mqttOptions = null;
 
       // 自动执行注册流程
       if (node.authType === 'product') {
@@ -30,18 +39,38 @@ module.exports = function (RED) {
       }
 
       node.on('close', (removed, done) => {
+        node.isClosing = true;
+        node.connectionStatus = 'disconnected';
+
+        if (node.reconnectTimer) {
+          clearTimeout(node.reconnectTimer);
+          node.reconnectTimer = null;
+        }
+
+        if (node.connectionTimeout) {
+          clearTimeout(node.connectionTimeout);
+          node.connectionTimeout = null;
+        }
+
+        if (node.mqttClient && node.boundMqttHandlers) {
+          node.mqttClient.removeListener('connect', node.boundMqttHandlers.onConnectHandler);
+          node.mqttClient.removeListener('offline', node.boundMqttHandlers.onOfflineHandler);
+          node.mqttClient.removeListener('close', node.boundMqttHandlers.onCloseHandler);
+          node.mqttClient.removeListener('error', node.boundMqttHandlers.onErrorHandler);
+          node.mqttClient.removeListener('end', node.boundMqttHandlers.onEndHandler);
+        }
+
         // 手动关闭 MQTT 连接
-        if (node.mqttClient && node.mqttClient.connected) {
+        if (node.mqttClient) {
           node.log('正在手动关闭 MQTT 连接...');
-          // 使用 end 优雅关闭，并等待完成
-          node.connectionStatus = 'disconnected';
           node.mqttClient.end(false, () => {
             node.log('手动关闭MQTT连接');
             done();
           });
-        } else {
-          done();
+          return;
         }
+
+        done();
       });
     }
 
@@ -94,7 +123,7 @@ module.exports = function (RED) {
         username: this.productKey,
         password: password,
         clean: true,
-        reconnectPeriod: 5000
+        reconnectPeriod: 0
       };
       return mqtt.connect(`mqtt://${this.server}:1883`, options);
     }
@@ -211,65 +240,136 @@ module.exports = function (RED) {
         keepalive: 25,
         clean: false,
         cleanSession: false,
-        reconnectPeriod: 5000,
+        reconnectPeriod: 0,
         resubscribe: false // 保证客户端连接建立后重新发送subscribe包创建订阅，避免brocker端重启后订阅丢失，客户端由于缓存而无法重新建立订阅
+      };
+
+      node.mqttUrl = url;
+      node.mqttOptions = options;
+
+      const clearConnectionTimeout = () => {
+        if (node.connectionTimeout) {
+          clearTimeout(node.connectionTimeout);
+          node.connectionTimeout = null;
+        }
+      };
+
+      const startConnectionTimeout = () => {
+        clearConnectionTimeout();
+        node.connectionTimeout = setTimeout(() => {
+          if (node.isClosing || !node.mqttClient) {
+            return;
+          }
+          if (node.connectionStatus === 'connecting' || node.connectionStatus === 'reconnecting') {
+            node.status({ fill: 'red', shape: 'ring', text: '连接超时' });
+            node.error('MQTT连接超时');
+            node.mqttClient.end(true);
+          }
+        }, 10000);
+      };
+
+      const scheduleReconnect = () => {
+        if (node.isClosing || !node.mqttClient || node.reconnectTimer) {
+          return;
+        }
+
+        node.reconnectAttempt += 1;
+        const rawDelay = node.reconnectBaseDelay * Math.pow(2, node.reconnectAttempt - 1);
+        const cappedDelay = Math.min(rawDelay, node.reconnectMaxDelay);
+        const jitterFactor = 0.75 + (Math.random() * 0.5);
+        const delay = Math.round(cappedDelay * jitterFactor);
+
+        node.connectionStatus = 'reconnecting';
+        node.status({ fill: 'yellow', shape: 'ring', text: `重连中(${Math.round(delay / 1000)}s)` });
+        node.log(`MQTT将在 ${delay}ms 后进行第 ${node.reconnectAttempt} 次重连（基准延迟 ${cappedDelay}ms，抖动系数 ${jitterFactor.toFixed(2)}）`);
+
+        node.reconnectTimer = setTimeout(() => {
+          node.reconnectTimer = null;
+          if (node.isClosing || !node.mqttClient) {
+            return;
+          }
+
+          node.connectionStatus = 'reconnecting';
+          startConnectionTimeout();
+          node.log(`开始第 ${node.reconnectAttempt} 次MQTT重连`);
+          node.mqttClient.emit('reconnect');
+          node.mqttClient.reconnect();
+        }, delay);
       };
 
       // 状态管理
       node.connectionStatus = 'connecting';
-      // 添加连接超时检测
-      const connectionTimeout = setTimeout(() => {
-        if (node.connectionStatus === 'connecting') {
-          node.status({ fill: 'red', text: '连接超时' });
-          node.error('MQTT连接超时');
-          if (node.mqttClient) node.mqttClient.end(true);
-        }
-      }, 10000); // 10秒超时
       node.status({ fill: 'yellow', shape: 'ring', text: '连接中...' });
 
-      // 初始化连接
-      node.mqttClient = mqtt.connect(url, options);
+      // 初始化连接：只创建一次 client，后续始终在同一个实例上手动重连，确保外部节点绑定的监听器不丢失
+      if (!node.mqttClient) {
+        node.mqttClient = mqtt.connect(url, options);
+      }
+      startConnectionTimeout();
 
       // 在构造函数内部，定义具名函数（确保在 close 回调中可以访问）
       const onConnectHandler = () => {
+        clearConnectionTimeout();
+        node.reconnectAttempt = 0;
+        if (node.reconnectTimer) {
+          clearTimeout(node.reconnectTimer);
+          node.reconnectTimer = null;
+        }
         node.connectionStatus = 'connected';
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
         node.log('MQTT连接成功');
       };
 
-      const onReconnectHandler = () => {
-        node.log('MQTT正在尝试重连...');
+      const onOfflineHandler = () => {
+        if (node.isClosing) {
+          return;
+        }
+        node.log('MQTT已离线');
         node.connectionStatus = 'reconnecting';
-        node.status({ fill: 'yellow', shape: 'ring', text: '重连中...' });
+        node.status({ fill: 'yellow', shape: 'ring', text: '连接已断开，等待重连' });
       };
 
       const onErrorHandler = (err) => {
+        clearConnectionTimeout();
         node.connectionStatus = 'error';
         node.status({ fill: 'red', shape: 'ring', text: '连接错误' });
         node.error('MQTT错误: ' + err.message);
       };
 
+      const onCloseHandler = () => {
+        clearConnectionTimeout();
+        if (node.isClosing) {
+          node.connectionStatus = 'disconnected';
+          node.log('MQTT已断开');
+          node.status({ fill: 'grey', shape: 'ring', text: '已断开' });
+          return;
+        }
+
+        node.log('MQTT连接关闭，准备手动重连');
+        // scheduleReconnect();
+      };
+
       const onEndHandler = () => {
+        clearConnectionTimeout();
         node.connectionStatus = 'disconnected';
         node.log('MQTT已断开');
         node.status({ fill: 'grey', shape: 'ring', text: '已断开' });
       };
 
+      node.boundMqttHandlers = {
+        onConnectHandler,
+        onOfflineHandler,
+        onCloseHandler,
+        onErrorHandler,
+        onEndHandler
+      };
+
       // 绑定事件时使用具名函数
       node.mqttClient.on('connect', onConnectHandler);
-      node.mqttClient.on('reconnect', onReconnectHandler);
+      node.mqttClient.on('offline', onOfflineHandler);
+      node.mqttClient.on('close', onCloseHandler);
       node.mqttClient.on('error', onErrorHandler);
       node.mqttClient.on('end', onEndHandler);
-
-      // 在 close 回调中移除这些监听器
-      node.on('close', () => {
-        if (node.mqttClient) {
-          node.mqttClient.removeListener('connect', onConnectHandler);
-          node.mqttClient.removeListener('reconnect', onReconnectHandler);
-          node.mqttClient.removeListener('error', onErrorHandler);
-          node.mqttClient.removeListener('end', onEndHandler);
-        }
-      });
     }
   }
 

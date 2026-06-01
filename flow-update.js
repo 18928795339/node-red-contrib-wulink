@@ -37,14 +37,12 @@ module.exports = function (RED) {
 
       let onConnectHandler = () => {
         subscribeTopic();
-        node.log("connected");
-        /** 延迟发送缓存消息，避免因为会话尚未就绪而导致的消息丢弃问题（或者可以判断当前mqttClient.connected是否为true）*/
-        setTimeout(() => {
+        if (mqttClient.connected) {
           node.send({
             _msgid: RED.util.generateId(),
             status: { text: 'connected' }
           });
-        }, 500);
+        }
       };
 
       let onOfflineHandler = () => {
@@ -52,13 +50,6 @@ module.exports = function (RED) {
         node.send({
           _msgid: RED.util.generateId(),
           status: { text: 'offline' }
-        });
-      };
-
-      let onReconnectHandler = () => {
-        node.send({
-          _msgid: RED.util.generateId(),
-          status: { text: 'reconnect' }
         });
       };
 
@@ -87,7 +78,6 @@ module.exports = function (RED) {
 
       mqttClient.on('connect', onConnectHandler);
       mqttClient.on('offline', onOfflineHandler);
-      mqttClient.on('reconnect', onReconnectHandler);
       mqttClient.on('error', onErrorHandler);
       mqttClient.on('close', onCloseHandler);
       mqttClient.on('end', onEndHandler);
@@ -232,13 +222,11 @@ module.exports = function (RED) {
           node.status({ fill: 'red', shape: 'ring', text: 'OTA恢复失败' });
           return;
         }
-        if(mqttClient?.connected){
-          setTimeout(() => {
-            node.send({
-              _msgid: RED.util.generateId(),
-              status: { text: 'connected' }
-            });
-          }, 500);
+        if (mqttClient.connected) {
+          node.send({
+            _msgid: RED.util.generateId(),
+            status: { text: 'connected' }
+          });
         }
         persistRuntimeConfig(restoreData);
         updateOtaState({
@@ -866,12 +854,10 @@ module.exports = function (RED) {
             const success = await deployFlows(data.nodeConfigs, data.replaceAll, topic);
             node.log('流程部署返回结果: ' + success);
             if (mqttClient?.connected) {
-              setTimeout(() => {
-                node.send({
-                  _msgid: RED.util.generateId(),
-                  status: { text: 'connected' }
-                });
-              }, 500);
+              node.send({
+                _msgid: RED.util.generateId(),
+                status: { text: 'connected' }
+              });
             }
             if (success) {
               cacheLastConfigMessage(payload);

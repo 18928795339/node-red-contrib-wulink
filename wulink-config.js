@@ -346,7 +346,7 @@ module.exports = function (RED) {
         }
 
         node.log('MQTT连接关闭，准备手动重连');
-        // scheduleReconnect();
+        scheduleReconnect();
       };
 
       const onEndHandler = () => {

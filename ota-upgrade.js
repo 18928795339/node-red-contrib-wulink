@@ -1,35 +1,41 @@
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const otaProtocol = require('./wulink-ota-protocol');
 
 /**
-    node-red 需通过service或者systemctl启动，只有这样才能通过exec执行重启命令
-    * OTA 响应码说明：20000=已收到升级命令并开始下载安装；
-    * 20001=安装完成并准备重启；
-    * 20002=重启成功且流程重新加载完毕；
-    * 40000=消息处理、安装或重启过程中发生失败。
-    * 40001=重启成功但是没找到可供流程重构的配置数据
-    * 40002=有可供重新构建流程的配置数据但是重新构建流程失败
-**/ 
+ * node-red 需通过 service 或者 systemctl 启动，只有这样才能通过 exec 执行重启命令
+ * OTA 协议见 https://dev.kunlun.cloud/docs/interfaceDocument/ota.html
+ */
 module.exports = function (RED) {
     function OtaUpgradeNode(config) {
         RED.nodes.createNode(this, config);
         const node = this;
         node.configNode = RED.nodes.getNode(config.config);
         const mqttClient = node.configNode?.mqttClient;
-        const PERSIST_STORE = 'file';
-        const OTA_STATE_KEY = 'wulink:otaState';
         const userDir = RED.settings.userDir || process.cwd();
         const dataDir = path.join(userDir, 'data');
         const OTA_STATE_FILE = path.join(dataDir, 'wulink-ota-state.json');
-        const { productKey, deviceName } = node.configNode;
-        const otaTopic = config.otaTopic || `/sys/${productKey}/${deviceName}/ota/update/push`;
-        const packageUrlField = config.packageUrlField || 'data.packageUrl';
+
+        const productKey = node.configNode?.productKey;
+        const deviceName = node.configNode?.deviceName;
+        const currentVersion = config.currentVersion || '0.1.6';
         const restartStrategy = config.restartStrategy || 'custom-command';
         const restartCommand = config.restartCommand || 'service node-red restart';
         const restartDelayMs = Math.max(0, Number(config.restartDelayMs ?? 3000) || 3000);
+        const packageBaseUrl = config.packageBaseUrl || '';
+        const installCwd = config.installCwd || '/work/node-red';
+
+        const upgradeTopic = productKey && deviceName
+            ? otaProtocol.upgradeTopic(productKey, deviceName)
+            : null;
+        const progressTopicName = productKey && deviceName
+            ? otaProtocol.progressTopic(productKey, deviceName)
+            : null;
 
         let pendingTask = null;
+        let upgradeMessageId = null;
+
         const writeJsonFileSync = (filePath, value) => {
             try {
                 fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -39,89 +45,65 @@ module.exports = function (RED) {
             }
         };
 
-        const getByPath = (source, fieldPath) => {
-            if (!fieldPath) {
-                return undefined;
-            }
-            return fieldPath.split('.').reduce((current, key) => {
-                if (current == null) {
-                    return undefined;
-                }
-                return current[key];
-            }, source);
-        };
-
-        const publishReply = (payload, code, message, extra = {}) => {
-            mqttClient.publish(`${otaTopic}_reply`, JSON.stringify({
-                id: payload?.id,
-                method: payload?.method ? `${payload.method}_reply` : undefined,
-                version: payload?.version || '1.0',
-                code,
-                message,
-                ...extra
-            }), { qos: 1 });
-        };
-
         const updateOtaState = (patch) => {
+            let previousState = {};
+            try {
+                if (fs.existsSync(OTA_STATE_FILE)) {
+                    previousState = JSON.parse(fs.readFileSync(OTA_STATE_FILE, 'utf8'));
+                }
+            } catch (_) {
+                previousState = {};
+            }
             const nextState = {
+                ...previousState,
                 ...patch,
                 updatedAt: new Date().toISOString()
             };
-
             writeJsonFileSync(OTA_STATE_FILE, nextState);
             return nextState;
         };
 
+        const publishJson = (topic, message) => {
+            if (!mqttClient?.connected || !topic) {
+                return;
+            }
+            mqttClient.publish(topic, JSON.stringify(message), { qos: 1 });
+        };
+
+        const publishProgress = (percent, step, desc) => {
+            if (!progressTopicName) {
+                return;
+            }
+            publishJson(
+                progressTopicName,
+                otaProtocol.buildProgressMessage({ percent, step, desc }, upgradeMessageId)
+            );
+        };
+
+        const reportFailure = (step, desc, statusPatch = {}) => {
+            publishProgress(1, step, desc);
+            updateOtaState({
+                status: statusPatch.status || 'install_failed',
+                error: desc,
+                ...statusPatch
+            });
+            node.status({ fill: 'red', shape: 'ring', text: desc.slice(0, 20) });
+            node.error(desc);
+        };
+
         const buildInstallCommand = (packageUrl) => `npm install "${packageUrl}"`;
 
-        const executeInstallCommand = (payload, packageUrl) => {
-            const installCommand = buildInstallCommand(packageUrl);
-
-            updateOtaState({
-                status: 'installing',
-                otaTopic,
-                packageUrl,
-                packageUrlField,
-                installCommand,
-                restartStrategy,
-                restartCommand,
-                restartDelayMs,
-                request: payload,
-                installRequestedAt: new Date().toISOString()
-            });
-
-            node.status({ fill: 'blue', shape: 'dot', text: '安装中' });
-            exec(installCommand, { cwd: '/work/node-red', timeout: 60000 }, (error, stdout, stderr) => {
-                if (stdout) {
-                    node.log(`安装命令输出: ${stdout}`);
-                }
-                if (stderr) {
-                    node.warn(`安装命令告警: ${stderr}`);
-                }
-
-                if (error) {
-                    updateOtaState({
-                        status: 'install_failed',
-                        installError: error.message,
-                        installResult: { stdout, stderr }
-                    });
-                    node.status({ fill: 'red', shape: 'ring', text: 'OTA 安装失败' });
-                    publishReply(payload, 40000, `OTA 安装失败: ${error.message}`);
-                    node.error(`OTA 安装失败: ${error.message}`);
-                    return;
-                }
-
-                updateOtaState({
-                    status: 'restore_needed',
-                    installFinishedAt: new Date().toISOString(),
-                    installResult: { stdout, stderr },
-                    packageUrl,
-                    otaTopic,
-                    restartDelayMs
-                });
-                publishReply(payload, 20001, 'OTA 安装完成，准备重启 Node-RED');
-                scheduleRestart();
-            });
+        const resolveInstallUrl = (url) => {
+            try {
+                return otaProtocol.resolvePackageUrl(url, packageBaseUrl);
+            } catch (error) {
+                reportFailure(
+                    otaProtocol.PROGRESS_STEP.DOWNLOAD_FAILED,
+                    error.message,
+                    { status: 'install_failed' }
+                );
+                return null;
+            }
         };
 
         const scheduleRestart = () => {
@@ -144,69 +126,145 @@ module.exports = function (RED) {
                         node.warn(`重启命令告警: ${stderr}`);
                     }
                     if (error) {
-                        node.warn(`重启命令执行失败: ${error}`);
                         updateOtaState({
                             status: 'restart_failed',
                             restartError: error.message,
                             restartFinishedAt: new Date().toISOString()
                         });
-                        if (pendingTask?.payload) {
-                            publishReply(pendingTask.payload, 40000, `OTA 重启失败: ${error.message}`);
+                        if (pendingTask) {
+                            reportFailure(
+                                otaProtocol.PROGRESS_STEP.FAILED,
+                                `OTA 重启失败: ${error.message}`,
+                                { status: 'restart_failed' }
+                            );
                         }
                         node.status({ fill: 'red', shape: 'ring', text: 'OTA 重启失败' });
-                        node.error(`OTA 重启失败: ${error.message}`);
                     }
                 });
             }, restartDelayMs);
         };
 
-        const handleOtaCommand = (payload) => {
-            const packageUrl = getByPath(payload, packageUrlField);
-            if (!packageUrl) {
-                throw new Error(`OTA 消息中未找到升级包链接字段: ${packageUrlField}`);
+        const executeInstallCommand = (upgradeInfo) => {
+            const { url, version, raw: payload } = upgradeInfo;
+            const fullUrl = resolveInstallUrl(url);
+            if (!fullUrl) {
+                return;
             }
+            const installCommand = buildInstallCommand(fullUrl);
+
+            updateOtaState({
+                status: 'installing',
+                productKey,
+                deviceName,
+                currentVersion,
+                targetVersion: version,
+                packageUrl: url,
+                packageFullUrl: fullUrl,
+                upgradeInfo,
+                installCommand,
+                restartStrategy,
+                restartCommand,
+                restartDelayMs,
+                request: payload,
+                upgradeMessageId,
+                installRequestedAt: new Date().toISOString()
+            });
+
+            node.log(`OTA 开始 npm install: ${fullUrl}`);
+            publishProgress(30, otaProtocol.PROGRESS_STEP.UPGRADING, '开始下载安装包');
+            node.status({ fill: 'blue', shape: 'dot', text: '安装中' });
+
+            exec(installCommand, { cwd: installCwd, timeout: 600000 }, (error, stdout, stderr) => {
+                if (stdout) {
+                    node.log(`安装命令输出: ${stdout}`);
+                }
+                if (stderr) {
+                    node.warn(`安装命令告警: ${stderr}`);
+                }
+
+                if (error) {
+                    updateOtaState({
+                        status: 'install_failed',
+                        installError: error.message,
+                        installResult: { stdout, stderr }
+                    });
+                    reportFailure(
+                        otaProtocol.PROGRESS_STEP.DOWNLOAD_FAILED,
+                        `OTA 安装失败: ${error.message}`
+                    );
+                    return;
+                }
+
+                publishProgress(70, otaProtocol.PROGRESS_STEP.UPGRADING, '安装包下载安装完成');
+                updateOtaState({
+                    status: 'restore_needed',
+                    installFinishedAt: new Date().toISOString(),
+                    installResult: { stdout, stderr },
+                    packageUrl: url,
+                    packageFullUrl: fullUrl,
+                    targetVersion: version,
+                    restartDelayMs
+                });
+                publishProgress(80, otaProtocol.PROGRESS_STEP.UPGRADING, 'OTA 安装完成，准备重启 Node-RED');
+                scheduleRestart();
+            });
+        };
+
+        const handleOtaCommand = (payload) => {
+            const upgradeInfo = otaProtocol.parseUpgradePayload(payload);
+            upgradeMessageId = upgradeInfo.id ? String(upgradeInfo.id) : otaProtocol.generateMessageId();
 
             pendingTask = {
-                id: payload?.id,
-                method: payload?.method,
-                packageUrl,
+                id: upgradeMessageId,
+                packageUrl: upgradeInfo.url,
+                targetVersion: upgradeInfo.version,
                 payload,
                 receivedAt: new Date().toISOString()
             };
-            publishReply(payload, 20000, 'OTA 命令已接收，开始下载安装包');
-            executeInstallCommand(payload, packageUrl);
+
+            publishProgress(10, otaProtocol.PROGRESS_STEP.UPGRADING, 'OTA 命令已接收，开始下载安装包');
+            executeInstallCommand(upgradeInfo);
         };
 
         const handleMqttMessage = (topic, message) => {
-            if (topic !== otaTopic) {
+            if (topic !== upgradeTopic) {
                 return;
             }
 
             try {
-                node.log(`收到 OTA 消息: ${message}`);
+                node.log(`收到 OTA 升级消息: ${message}`);
                 const payload = JSON.parse(message.toString());
                 handleOtaCommand(payload);
             } catch (error) {
                 node.status({ fill: 'red', shape: 'ring', text: 'OTA 消息处理失败' });
                 try {
                     const payload = JSON.parse(message.toString());
-                    publishReply(payload, 40000, `OTA 消息处理失败: ${error.message}`);
+                    upgradeMessageId = payload?.id ? String(payload.id) : otaProtocol.generateMessageId();
+                    reportFailure(
+                        otaProtocol.PROGRESS_STEP.FAILED,
+                        `OTA 消息处理失败: ${error.message}`
+                    );
                 } catch (_) {
-                    node.warn('OTA 消息解析失败，无法回传带请求ID的错误响应');
+                    node.warn('OTA 消息解析失败，无法上报进度');
                 }
-                node.error(`OTA 消息处理失败: ${error.message}`);
             }
         };
 
-        const subscribeTopic = () => {
+        const subscribeUpgradeTopic = () => {
             node.status({ fill: 'green', shape: 'dot', text: '已连接' });
-            mqttClient.subscribe(otaTopic, { qos: 1 }, (err) => {
+
+            if (!upgradeTopic) {
+                node.error('缺少 productKey/deviceName，无法订阅 OTA 升级 Topic');
+                return;
+            }
+
+            mqttClient.subscribe(upgradeTopic, { qos: 1 }, (err) => {
                 if (err) {
-                    node.error(`订阅 OTA Topic 失败: ${err.message}`);
+                    node.error(`订阅 OTA 升级 Topic 失败: ${err.message}`);
                     node.status({ fill: 'red', shape: 'ring', text: 'OTA订阅失败' });
                     return;
                 }
-                node.log(`已订阅 OTA Topic: ${otaTopic}`);
+                node.log(`已订阅 OTA 升级 Topic: ${upgradeTopic}`);
             });
         };
 
@@ -215,11 +273,12 @@ module.exports = function (RED) {
             node.error('未获取到 MQTT 客户端，请检查 wulink-config 节点');
         } else {
             if (mqttClient.connected) {
-                subscribeTopic();
+                subscribeUpgradeTopic();
             }
-            mqttClient.on('connect', subscribeTopic);
+            mqttClient.on('connect', subscribeUpgradeTopic);
             mqttClient.on('message', handleMqttMessage);
         }
+
         if (node.configNode) {
             node.configNode.on('status', (status) => {
                 node.status(status);
@@ -228,7 +287,7 @@ module.exports = function (RED) {
 
         node.on('close', () => {
             if (mqttClient) {
-                mqttClient.removeListener('connect', subscribeTopic);
+                mqttClient.removeListener('connect', subscribeUpgradeTopic);
                 mqttClient.removeListener('message', handleMqttMessage);
             }
             node.status({});

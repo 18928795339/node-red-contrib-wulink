@@ -3,6 +3,7 @@ const path = require('path');
 const axios = require('axios');
 const { text } = require('stream/consumers');
 const { exec } = require('child_process');
+const otaProtocol = require('./wulink-ota-protocol');
 
 module.exports = function (RED) {
   function FlowUpdateNode(config) {
@@ -17,6 +18,7 @@ module.exports = function (RED) {
     const dataDir = path.join(userDir, 'data');
     const LAST_CONFIG_FILE = path.join(dataDir, 'wulink-last-config.json');
     const OTA_STATE_FILE = path.join(dataDir, 'wulink-ota-state.json');
+    const RUNTIME_CONFIG_FILE = path.join(dataDir, 'wulink-runtime-config.json');
 
     if (!node.configNode || !mqttClient) {
       node.error('MQTT未连接');
@@ -26,6 +28,42 @@ module.exports = function (RED) {
       node.log(node.configNode);
       const { productKey, deviceName } = node.configNode;
       const mqTopic = `/sys/${productKey}/${deviceName}/thing/config/push`;
+
+      const publishConnectionStatus = (statusText) => {
+        node.send({
+          _msgid: RED.util.generateId(),
+          status: { text: statusText }
+        });
+      };
+
+      const syncConnectionStatus = () => {
+        if (!mqttClient) {
+          return;
+        }
+        if (mqttClient.connected || node.configNode?.connectionStatus === 'connected') {
+          publishConnectionStatus('connected');
+        } else {
+          publishConnectionStatus('offline');
+        }
+      };
+
+      const scheduleConnectionStatusSync = () => {
+        const sendConnectedToQueue = () => {
+          if (!mqttClient?.connected && node.configNode?.connectionStatus !== 'connected') {
+            return;
+          }
+          node.send({
+            _msgid: RED.util.generateId(),
+            status: { text: 'connected' }
+          });
+        };
+        if (RED.events) {
+          RED.events.once('flows:started', () => {
+            setTimeout(sendConnectedToQueue, 500);
+          });
+        }
+        setTimeout(sendConnectedToQueue, 3000);
+      };
 
       const subscribeTopic = () => {
         node.status({ fill: 'green', shape: 'dot', text: '已连接' });
@@ -37,43 +75,24 @@ module.exports = function (RED) {
 
       let onConnectHandler = () => {
         subscribeTopic();
-        if (mqttClient.connected) {
-          node.send({
-            _msgid: RED.util.generateId(),
-            status: { text: 'connected' }
-          });
-        }
+        syncConnectionStatus();
       };
 
       let onOfflineHandler = () => {
         node.log("offline");
-        node.send({
-          _msgid: RED.util.generateId(),
-          status: { text: 'offline' }
-        });
+        publishConnectionStatus('offline');
       };
 
       let onErrorHandler = (err) => {
-        node.send({
-          _msgid: RED.util.generateId(),
-          status: { text: 'error' }
-        });
+        node.warn('MQTT error: ' + JSON.stringify(err));
       };
 
-      let onCloseHandler = () => {
-        node.log("close");
-        node.send({
-          _msgid: RED.util.generateId(),
-          status: { text: 'close' }
-        });
+      let onCloseHandler = (msg) => {
+        node.log('MQTT close: ' + JSON.stringify(msg));
       };
 
       let onEndHandler = () => {
-        node.log("end");
-        node.send({
-          _msgid: RED.util.generateId(),
-          status: { text: 'end' }
-        });
+        node.log('MQTT end');
       };
 
       mqttClient.on('connect', onConnectHandler);
@@ -171,15 +190,28 @@ module.exports = function (RED) {
         }
       };
 
-      const persistRuntimeConfig = (data) => {
+      const writeRuntimeConfigFile = (data) => {
+        writeJsonFileSync(RUNTIME_CONFIG_FILE, {
+          channelConfigs: data.channelConfigs,
+          nodeConfigs: {
+            reportAtBreakPoint: data.nodeConfigs?.reportAtBreakPoint
+          }
+        });
+      };
+
+      const hydrateFlowContext = (data) => {
         clearContextStore();
-        if (!data.nodeConfigs.reportAtBreakPoint) {
+        if (!data.nodeConfigs?.reportAtBreakPoint) {
           clearContextStore('file');
         }
-        node.context().flow.set('configs', data.channelConfigs, 'file');
-        node.context().flow.set('reportAtBreakPoint', data.nodeConfigs.reportAtBreakPoint, 'file');
-        node.context().flow.set('configs', data.channelConfigs);
-        node.context().flow.set('reportAtBreakPoint', data.nodeConfigs.reportAtBreakPoint);
+        setPersisted('configs', data.channelConfigs);
+        setPersisted('reportAtBreakPoint', data.nodeConfigs?.reportAtBreakPoint);
+        try {
+          node.context().flow.set('configs', data.channelConfigs);
+          node.context().flow.set('reportAtBreakPoint', data.nodeConfigs?.reportAtBreakPoint);
+        } catch (error) {
+          node.warn(`写入内存上下文失败: ${error.message}`);
+        }
       };
 
       const restoreFlowsIfNeeded = async () => {
@@ -187,54 +219,80 @@ module.exports = function (RED) {
         if (!otaState || otaState.status !== 'restore_needed') {
           return;
         }
-        const otaReplyTopic = `${otaState.otaTopic || '/ota/update/push'}_reply`;
-        const otaRequest = otaState.request;
-        const replyOtaResult = (code, message) => {
-          mqttClient.publish(otaReplyTopic, JSON.stringify({
-            id: otaRequest?.id,
-            method: otaRequest?.method ? `${otaRequest.method}_reply` : undefined,
-            version: otaRequest?.version || '1.0',
-            code,
-            message
-          }), { qos: 1 });
+
+        const productKey = otaState.productKey || node.configNode?.productKey;
+        const deviceName = otaState.deviceName || node.configNode?.deviceName;
+        const targetVersion = otaState.targetVersion || otaState.currentVersion;
+        const upgradeMessageId = otaState.upgradeMessageId || otaState.request?.id;
+        const progressTopicName = productKey && deviceName
+          ? otaProtocol.progressTopic(productKey, deviceName)
+          : null;
+        const informTopicName = productKey && deviceName
+          ? otaProtocol.informTopic(productKey, deviceName)
+          : null;
+
+        const publishProgress = (percent, step, desc) => {
+          if (!mqttClient?.connected || !progressTopicName) {
+            return;
+          }
+          mqttClient.publish(
+            progressTopicName,
+            JSON.stringify(otaProtocol.buildProgressMessage({ percent, step, desc }, upgradeMessageId)),
+            { qos: 1 }
+          );
         };
+
+        const publishNewVersion = (version) => {
+          if (!mqttClient?.connected || !informTopicName || !version) {
+            return;
+          }
+          mqttClient.publish(
+            informTopicName,
+            JSON.stringify(otaProtocol.buildInformMessage(version)),
+            { qos: 1 }
+          );
+          node.log(`OTA 升级完成，已上报版本: ${version} -> ${informTopicName}`);
+        };
+
+        const reportRestoreFailure = (desc, statusPatch = {}, step = otaProtocol.PROGRESS_STEP.FAILED) => {
+          publishProgress(1, step, desc);
+          updateOtaState({
+            status: 'restore_failed',
+            restoreError: desc,
+            ...statusPatch
+          });
+          node.error(desc);
+        };
+
+        publishProgress(90, otaProtocol.PROGRESS_STEP.UPGRADING, 'OTA 恢复流程中');
 
         const cachedConfig = getLastConfigMessage();
         const restoreData = cachedConfig?.payload?.data;
         if (!restoreData?.nodeConfigs || !restoreData?.channelConfigs) {
-          updateOtaState({
-            status: 'restore_failed',
+          reportRestoreFailure('OTA恢复失败: 未找到可恢复的配置缓存', {
             restoreError: '未找到可恢复的配置缓存'
           });
-          replyOtaResult(40001, 'OTA恢复失败: 未找到可恢复的配置缓存');
-          node.error('OTA 恢复失败：未找到可恢复的配置缓存');
+          node.status({ fill: 'red', shape: 'ring', text: 'OTA恢复失败' });
           return;
         }
 
         node.status({ fill: 'yellow', shape: 'ring', text: 'OTA恢复中' });
+        writeRuntimeConfigFile(restoreData);
         const success = await deployFlows(restoreData.nodeConfigs, restoreData.replaceAll, 'ota-restore');
         if (!success) {
-          updateOtaState({
-            status: 'restore_failed',
+          reportRestoreFailure('OTA恢复失败: 重建流程失败', {
             restoreError: '重建流程失败'
-          });
-          replyOtaResult(40002, 'OTA恢复失败: 重建流程失败');
+          }, otaProtocol.PROGRESS_STEP.BURN_FAILED);
           node.status({ fill: 'red', shape: 'ring', text: 'OTA恢复失败' });
           return;
         }
-        if (mqttClient.connected) {
-          node.send({
-            _msgid: RED.util.generateId(),
-            status: { text: 'connected' }
-          });
-        }
-        persistRuntimeConfig(restoreData);
+        publishProgress(100, otaProtocol.PROGRESS_STEP.UPGRADING, 'OTA 恢复成功');
+        publishNewVersion(targetVersion);
         updateOtaState({
           status: 'done',
           restoredAt: new Date().toISOString(),
           restoreError: undefined
         });
-        replyOtaResult(20002, 'OTA恢复成功');
         node.status({ fill: 'green', shape: 'dot', text: 'OTA恢复完成' });
         node.log('OTA 恢复完成，已根据磁盘缓存重新部署流程');
       };
@@ -527,7 +585,7 @@ module.exports = function (RED) {
 
         getReportAndClearDataNode() {
           const funcScript =
-            "try {\n    const parseValue = (value) => {\n        if (typeof value === 'number' && isFinite(value)) {\n            const rounded = Number(value.toFixed(6));\n            if (value !== rounded) {\n                return rounded;\n            }\n        }\n        return value;\n    };\n    node.log('上报已采集的数据');\n    let data = {};\n    const lastData = flow.get(\"lastData\");\n    const configs = flow.get(\"configs\") || flow.get(\"configs\", \"file\");\n    let allConfigs = {};\n    for (const key of Object.keys(configs)){\n        allConfigs = {...allConfigs, ...configs[key]};\n    }\n    const reportTypes = ['正常上报', '变化即上报', '差值过量上报'];\n    for (const key of flow.keys()) {\n        if (key.endsWith('-reportData')) {\n            const reportData = flow.get(key);\n            if (reportData != undefined) {\n                const filterData = {};\n                for (const metric of Object.keys(reportData)) {\n                    const currentValue = parseValue(reportData[metric]);\n                    if(lastData != undefined){\n                        const historyValue = lastData[metric];\n                        if (reportTypes[allConfigs[metric].reportSetting] == '正常上报') {\n                            filterData[metric] = currentValue;\n                        } else if (reportTypes[allConfigs[metric].reportSetting] == '变化即上报') {\n                            if (currentValue !== historyValue) {\n                                filterData[metric] = currentValue;\n                            }\n                        } else {\n                            if (historyValue == undefined || Math.abs(currentValue - historyValue) >= allConfigs[metric].differenceThreshold) {\n                                filterData[metric] = currentValue;\n                            }\n                        }\n                    } else {\n                        filterData[metric] = currentValue;\n                    }\n                }\n                data = { ...data, ...filterData };\n            }\n            flow.set(key, undefined);\n        }\n    }\n    if (Object.keys(data).length == 0) {\n        return;\n    }\n    if(lastData == undefined){\n        flow.set(\"lastData\", data);\n    } else {\n        flow.set(\"lastData\", {...lastData, ...data});\n    }\n    return {\n        ...msg, type: 'property', payload: {\n            time: Date.now(),\n            values: data,\n        }\n    };\n} catch (err) {\n    node.error('上报数据持久化失败: ' + err.message);\n    return null;\n}";
+            "try {\n    const parseValue = (value) => {\n        if (typeof value === 'number' && isFinite(value)) {\n            const rounded = Number(value.toFixed(6));\n            if (value !== rounded) {\n                return rounded;\n            }\n        }\n        return value;\n    };\n    node.log('上报已采集的数据');\n    let data = {};\n    const lastData = flow.get(\"lastData\");\n    const configs = flow.get(\"configs\") || flow.get(\"configs\", \"file\");\n    let allConfigs = {};\n    for (const key of Object.keys(configs)){\n        allConfigs = {...allConfigs, ...configs[key]};\n    }\n    const reportTypes = ['正常上报', '变化即上报', '差值过量上报'];\n    for (const key of flow.keys()) {\n        if (key.endsWith('-reportData')) {\n            const reportData = flow.get(key);\n            if (reportData != undefined) {\n                const filterData = {};\n                for (const metric of Object.keys(reportData)) {\n                    const currentValue = parseValue(reportData[metric]);\n                    if(lastData != undefined){\n                        const historyValue = lastData[metric];\n                        if (reportTypes[allConfigs[metric].reportSetting] == '正常上报') {\n                            filterData[metric] = currentValue;\n                        } else if (reportTypes[allConfigs[metric].reportSetting] == '变化即上报') {\n                            if (currentValue != historyValue) {\n                                filterData[metric] = currentValue;\n                            }\n                        } else {\n                            if (historyValue == undefined || Math.abs(currentValue - historyValue) >= allConfigs[metric].differenceThreshold) {\n                                filterData[metric] = currentValue;\n                            }\n                        }\n                    } else {\n                        filterData[metric] = currentValue;\n                    }\n                }\n                data = { ...data, ...filterData };\n            }\n            flow.set(key, undefined);\n        }\n    }\n    if (Object.keys(data).length == 0) {\n        return;\n    }\n    if(lastData == undefined){\n        flow.set(\"lastData\", data);\n    } else {\n        flow.set(\"lastData\", {...lastData, ...data});\n    }\n    return {\n        ...msg, type: 'property', payload: {\n            time: Date.now(),\n            values: data,\n        }\n    };\n} catch (err) {\n    node.error('上报数据持久化失败: ' + err.message);\n    return null;\n}";
           return this.getRunFunctionNode(undefined, undefined, funcScript, "reportAndClearData");
         }
 
@@ -562,8 +620,8 @@ module.exports = function (RED) {
             "name": "messageQueue",
             "connected": "^connected",
             "connectedType": "re",
-            "disconnected": "",
-            "disconnectedType": "str",
+            "disconnected": "^offline",
+            "disconnectedType": "re",
             "sqlite": "/work/sqlite",
             "filesize": "10240", // 最大消息存储上线 10G
             "wires": [
@@ -821,6 +879,8 @@ module.exports = function (RED) {
 
             if (nodeConfigs.reportAtBreakPoint) {
               nodeMap.get('flow-update').wires = [['messageQueue']];
+            } else {
+              nodeMap.get('flow-update').wires = [[]];
             }
 
             for (const item of flows) {
@@ -851,17 +911,11 @@ module.exports = function (RED) {
             node.log("收到配置数据: " + message);
             const payload = JSON.parse(message.toString());
             const data = payload.data;
+            writeRuntimeConfigFile(data);
             const success = await deployFlows(data.nodeConfigs, data.replaceAll, topic);
             node.log('流程部署返回结果: ' + success);
-            if (mqttClient?.connected) {
-              node.send({
-                _msgid: RED.util.generateId(),
-                status: { text: 'connected' }
-              });
-            }
             if (success) {
               cacheLastConfigMessage(payload);
-              persistRuntimeConfig(data);
               updateOtaState({
                 status: 'idle',
                 restoreError: undefined
@@ -891,24 +945,40 @@ module.exports = function (RED) {
       };
 
       mqttClient.on('message', handleMessage);
+
+      const cachedRuntimeConfig = readJsonFileSync(RUNTIME_CONFIG_FILE, null);
+      if (cachedRuntimeConfig?.channelConfigs) {
+        hydrateFlowContext(cachedRuntimeConfig);
+      }
+      if (cachedRuntimeConfig?.nodeConfigs?.reportAtBreakPoint) {
+        scheduleConnectionStatusSync();
+      }
+
       setTimeout(() => {
         node.warn('node-red启动成功准备恢复流程...');
         restoreFlowsIfNeeded().catch((error) => {
           const otaState = getOtaState();
-          const otaReplyTopic = `${otaState?.otaTopic || '/ota/update/push'}_reply`;
-          const otaRequest = otaState?.request;
+          const productKey = otaState?.productKey || node.configNode?.productKey;
+          const deviceName = otaState?.deviceName || node.configNode?.deviceName;
+          const progressTopicName = productKey && deviceName
+            ? otaProtocol.progressTopic(productKey, deviceName)
+            : null;
           node.error(`OTA 恢复流程异常: ${error.message}`);
           updateOtaState({
             status: 'restore_failed',
             restoreError: error.message
           });
-          mqttClient.publish(otaReplyTopic, JSON.stringify({
-            id: otaRequest?.id,
-            method: otaRequest?.method ? `${otaRequest.method}_reply` : undefined,
-            version: otaRequest?.version || '1.0',
-            code: 40000,
-            message: `OTA恢复失败: ${error.message}`
-          }), { qos: 1 });
+          if (mqttClient?.connected && progressTopicName) {
+            mqttClient.publish(
+              progressTopicName,
+              JSON.stringify(otaProtocol.buildProgressMessage({
+                percent: 1,
+                step: otaProtocol.PROGRESS_STEP.FAILED,
+                desc: `OTA恢复失败: ${error.message}`
+              }, otaState?.upgradeMessageId || otaState?.request?.id)),
+              { qos: 1 }
+            );
+          }
         });
       }, 5000);
 

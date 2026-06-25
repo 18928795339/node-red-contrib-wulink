@@ -12,8 +12,8 @@ module.exports = function (RED) {
       const { productKey, deviceName } = node.configNode;
       // 设置属性Topic
       const setTopic = `/sys/${productKey}/${deviceName}/thing/property/set`;
-      // 服务调用topic
-      const serviceTopic = `/sys/${productKey}/${deviceName}/thing/service/+`;
+      // 服务调用topic 设备端只允许订阅精确topic,不支持通配符,若要订阅需要将+号换成具体服务标识符
+      // const serviceTopic = `/sys/${productKey}/${deviceName}/thing/service/+`;
 
       const onConnectHandler = () => {
         node.status({ fill: 'green', shape: 'dot', text: '监听中' });
@@ -22,9 +22,9 @@ module.exports = function (RED) {
           if (!err) node.log(`已订阅设置属性Topic: ${setTopic}`);
         });
         // 订阅服务调用
-        mqttClient.subscribe(serviceTopic, { qos: 1 }, (err) => {
-          if (!err) node.log(`已订阅服务调用topic: ${serviceTopic}`);
-        });
+        // mqttClient.subscribe(serviceTopic, { qos: 1 }, (err) => {
+        //   if (!err) node.log(`已订阅服务调用topic: ${serviceTopic}`);
+        // });
       }
 
       const onMessageHandler = (topic, message) => {

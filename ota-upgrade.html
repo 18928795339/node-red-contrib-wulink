@@ -4,12 +4,12 @@
     <input type="text" id="node-input-config" placeholder="选择配置">
   </div>
   <div class="form-row">
-    <label for="node-input-otaTopic"><i class="fa fa-rss"></i> OTA Topic</label>
-    <input type="text" id="node-input-otaTopic" placeholder="/ota/update/push">
+    <label for="node-input-currentVersion"><i class="fa fa-code-fork"></i> 当前版本</label>
+    <input type="text" id="node-input-currentVersion" placeholder="0.1.5">
   </div>
   <div class="form-row">
-    <label for="node-input-packageUrlField"><i class="fa fa-link"></i> 包链接字段</label>
-    <input type="text" id="node-input-packageUrlField" placeholder="data.packageUrl">
+    <label for="node-input-packageBaseUrl"><i class="fa fa-link"></i> 升级包 Base URL</label>
+    <input type="text" id="node-input-packageBaseUrl" placeholder="https://dev.kunlun.cloud">
   </div>
   <div class="form-row">
     <label for="node-input-restartStrategy"><i class="fa fa-refresh"></i> 重启策略</label>
@@ -47,8 +47,8 @@
         type: 'wulink-config',
         required: true
       },
-      otaTopic: { value: '/ota/update/push', required: true },
-      packageUrlField: { value: 'data.packageUrl', required: true },
+      currentVersion: { value: '0.1.6', required: true },
+      packageBaseUrl: { value: 'https://dev.kunlun.cloud', required: true },
       restartStrategy: { value: 'custom-command', required: true },
       restartCommand: { value: 'service node-red restart' },
       restartDelayMs: { value: 3000, required: true, validate: RED.validators.number() }

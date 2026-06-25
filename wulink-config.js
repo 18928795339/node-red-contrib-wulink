@@ -10,7 +10,7 @@ module.exports = function (RED) {
       node.authType = config.authType || 'device';
       node.productKey = config.productKey;
       node.productSecret = config.productSecret;
-      node.serialNumber = config.serialNumber;
+      node.serialNumber = config.serialNumber || config.deviceName;
       node.deviceName = config.deviceName;
       node.deviceSecret = config.deviceSecret;
       node.server = config.server || 'iot.wulink.tech';
@@ -191,6 +191,7 @@ module.exports = function (RED) {
       node.productKey = credentials.productKey;
       node.deviceName = credentials.deviceName;
       node.deviceSecret = credentials.deviceSecret;
+      node.serialNumber = credentials.serialNumber || credentials.deviceName || node.serialNumber;
       node.registered = true;
 
       // 保存到Node-RED上下文
@@ -212,6 +213,8 @@ module.exports = function (RED) {
         .update(str)
         .digest('hex')
         .toUpperCase();
+      
+      node.error('生成密码: ' + password);
 
       return { clientId, username: clientId, password };
     }
